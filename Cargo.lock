@@ -140,9 +140,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "reelforge-core"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dad114d73287cefaabaae1f20099a8389bcba63f72b69978ebec49a2a41bc87"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "reelforge-intelligence-core"
 version = "0.1.0"
 dependencies = [
+ "reelforge-render-graph",
  "serde",
  "serde_json",
  "thiserror",
@@ -159,6 +170,18 @@ dependencies = [
  "sightloom-core",
  "sightloom-index",
  "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "reelforge-render-graph"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "821ec21f34cc63671f3d1820bf12f57090e99f15aec5ef7e906c0ee128a867a1"
+dependencies = [
+ "reelforge-core",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

@@ -17,6 +17,7 @@ authors = ["Sergii Ziborov"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+reelforge-render-graph = "0.1.5"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

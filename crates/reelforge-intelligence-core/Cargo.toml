@@ -12,6 +12,7 @@ description = "Semantic edit contracts for ReelForge Intelligence (Milestone 0)"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+reelforge-render-graph = { workspace = true }
 
 [lints]
 workspace = true

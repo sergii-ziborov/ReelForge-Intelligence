@@ -81,6 +81,54 @@ pub fn dispatch(svc: &IntelligenceService, method: &str, args: &Value) -> Result
             let (report, req) = svc.approve_and_render(&resolved, by)?;
             Ok(serde_json::json!({ "report": report, "request": req }))
         }
+        "compile_and_bridge" => {
+            let resolved = resolved_arg(args)?;
+            let output = args
+                .get("output")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let require_approval = args
+                .get("require_approval")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let opts = crate::bridge::BridgeOptions {
+                output_uri: output,
+                require_approval,
+                ..crate::bridge::BridgeOptions::default()
+            };
+            let (report, bridged) = svc.compile_and_bridge(&resolved, &opts)?;
+            Ok(serde_json::json!({
+                "report": report,
+                "graph_json": bridged.graph_json,
+                "warnings": bridged.warnings,
+                "has_execution_plan": bridged.execution_plan.is_some(),
+            }))
+        }
+        "bridge_graph" => {
+            let ir = args
+                .get("graph")
+                .ok_or_else(|| IntelError::message("bridge_graph: graph required"))?;
+            let ir: crate::render_graph::RenderGraphIr = if let Some(s) = ir.as_str() {
+                serde_json::from_str(s).map_err(|e| IntelError::message(e.to_string()))?
+            } else {
+                serde_json::from_value(ir.clone())
+                    .map_err(|e| IntelError::message(e.to_string()))?
+            };
+            let output = args
+                .get("output")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let opts = crate::bridge::BridgeOptions {
+                output_uri: output,
+                ..crate::bridge::BridgeOptions::default()
+            };
+            let bridged = svc.bridge_graph(&ir, &opts)?;
+            Ok(serde_json::json!({
+                "graph_json": bridged.graph_json,
+                "warnings": bridged.warnings,
+                "has_execution_plan": bridged.execution_plan.is_some(),
+            }))
+        }
         other => Err(IntelError::message(format!(
             "unknown intelligence method `{other}`"
         ))),

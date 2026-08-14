@@ -28,7 +28,8 @@ Owns the missing layer:
 2. `AnalysisSnapshot` — host projection of VisionIndex  
 3. `ResolvedEditPlan` — freeze for reproducibility  
 4. `compile_resolved` — typed `RenderGraphIr` + JSON for ReelForge  
-5. `approve` / `approve_and_render` — privacy Review gate
+5. `approve` / `approve_and_render` — privacy Review gate  
+6. `bridge_to_reelforge` — live `reelforge_render_graph::RenderGraph` + `schedule_graph`
 
 ## Do not put in Intelligence
 
@@ -41,14 +42,15 @@ Owns the missing layer:
 1. **Namespaced IDs** — `NamespacedId` / `sightloom://…`  
 2. **Mask domains** — `MaskFidelity`, `MaskRequest`, `MaskArtifact`  
 3. **PrivacyPolicy** — uncertain, missing_mask, low_confidence, track_gap  
-4. **`AnalysisProvider` trait** + **`SightLoomProvider`** over `AnalysisSnapshot`
+4. **`AnalysisProvider` trait** + **`SightLoomProvider`** over `AnalysisSnapshot`  
+5. **ReelForge bridge** — `RenderGraphIr` → `RenderGraph` / `ExecutionPlan` (`reelforge-render-graph` 0.1.5)
 
 ## Next milestones
 
 1. ~~Fill `AnalysisSnapshot` from real SightLoom package~~ **done**  
 2. ~~Stronger RenderGraph schema~~ **done** (`RenderGraphIr` + op ids)  
 3. ~~Approve workflow~~ **done** (`ApprovalRecord`, `approve_and_render`)  
-4. Map `RenderGraphIr` → live `reelforge::RenderGraph` / run plan  
-5. MCP host binary packaging
-
+4. ~~Map `RenderGraphIr` → live `reelforge::RenderGraph` / schedule~~ **done**  
+5. MCP host binary packaging  
+6. Optional: denser mask materialization into `MaskTimeline` before redaction
 

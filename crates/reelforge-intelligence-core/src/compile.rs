@@ -3,6 +3,7 @@
 //! Compiling raw [`crate::SemanticEditPlan`] without freeze is for **preview**
 //! only and is marked non-final.
 
+use crate::bridge::{BridgeOptions, BridgeResult, bridge_to_reelforge};
 use crate::error::IntelError;
 use crate::render_graph::{
     ApprovalRecord, RenderGraphIr, approval_for_resolved, approve, graph_from_resolved,
@@ -55,6 +56,12 @@ pub struct CompileReport {
     /// Approval gate (final only).
     #[serde(default)]
     pub approval: ApprovalRecord,
+    /// Live ReelForge graph JSON (after optional bridge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reelforge_graph_json: Option<String>,
+    /// Bridge warnings when reelforge graph was produced.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bridge_warnings: Vec<String>,
 }
 
 impl CompileReport {
@@ -143,4 +150,45 @@ pub fn approve_compile(mut report: CompileReport, by: impl Into<String>) -> Comp
 #[must_use]
 pub fn approval_status(resolved: &ResolvedEditPlan) -> ApprovalRecord {
     approval_for_resolved(resolved, &resolved.policy)
+}
+
+/// Attach a live ReelForge graph onto a final compile report.
+///
+/// # Errors
+///
+/// Bridge / validate / schedule failure.
+pub fn attach_reelforge_bridge(
+    mut report: CompileReport,
+    opts: &BridgeOptions,
+) -> crate::Result<CompileReport> {
+    let Some(ref ir) = report.render_graph else {
+        return Err(IntelError::message(
+            "attach_reelforge_bridge: compile report has no typed RenderGraphIr",
+        ));
+    };
+    let bridged = bridge_to_reelforge(ir, opts)?;
+    report.reelforge_graph_json = Some(bridged.graph_json);
+    report.bridge_warnings = bridged.warnings;
+    Ok(report)
+}
+
+/// Compile frozen plan and immediately bridge to ReelForge.
+///
+/// # Errors
+///
+/// Compile or bridge failure.
+pub fn compile_and_bridge(
+    resolved: &ResolvedEditPlan,
+    opts: &BridgeOptions,
+) -> crate::Result<(CompileReport, BridgeResult)> {
+    let report = compile_resolved(resolved)?;
+    let ir = report
+        .render_graph
+        .as_ref()
+        .ok_or_else(|| IntelError::message("compile_and_bridge: missing IR"))?;
+    let bridged = bridge_to_reelforge(ir, opts)?;
+    let mut report = report;
+    report.reelforge_graph_json = Some(bridged.graph_json.clone());
+    report.bridge_warnings.clone_from(&bridged.warnings);
+    Ok((report, bridged))
 }

@@ -18,6 +18,7 @@
 //!   → ResolvedEditPlan          (frozen, namespaced IDs)
 //!   → compile_resolved          (typed RenderGraphIr + JSON)
 //!   → approve (if privacy Review)
+//!   → bridge_to_reelforge        (live reelforge::RenderGraph + schedule)
 //!   → ReelForge execute
 //! ```
 //!
@@ -33,6 +34,7 @@
     clippy::needless_lifetimes
 )]
 
+mod bridge;
 mod catalog;
 mod compile;
 mod edit;
@@ -52,10 +54,14 @@ mod service;
 mod sightloom_provider;
 mod time;
 
+pub use bridge::{
+    BridgeOptions, BridgeResult, bridge_default, bridge_for_execute, bridge_to_reelforge,
+};
 pub use catalog::{HostCatalog, MediaInspection, SceneHit, SubjectHit};
 pub use compile::AnalysisProvider as AnalysisProviderDescriptor;
 pub use compile::{
-    CompileReport, CompileWarning, approval_status, approve_compile, compile_resolved,
+    CompileReport, CompileWarning, approval_status, approve_compile, attach_reelforge_bridge,
+    compile_and_bridge, compile_resolved,
 };
 pub use edit::{
     AnomalyQuery, FramingPolicy, FrequencyMetric, SEMANTIC_EDIT_PLAN_VERSION, SemanticEdit,

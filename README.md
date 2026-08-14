@@ -11,11 +11,13 @@ query SightLoom snapshot  ← host fills AnalysisSnapshot from VisionIndex
         ↓
 ResolvedEditPlan          ← frozen subjects / events / masks / ranges / hashes
         ↓
-compile_resolved          ← final RenderGraph JSON (ReelForge-shaped)
+compile_resolved          ← final RenderGraphIr + JSON
         ↓
-validate / preview / approve
+approve (privacy Review)  ← optional operator gate
         ↓
-ReelForge execute
+bridge_to_reelforge       ← live reelforge_render_graph::RenderGraph + schedule
+        ↓
+ReelForge execute         ← host run_render_graph / encode
 ```
 
 ## Why two documents?
@@ -96,9 +98,40 @@ cargo test -p reelforge-intelligence-sightloom
 
 Preview intent compile stays `final_graph: false`.
 
+## Bridge to live ReelForge
+
+`bridge_to_reelforge` / `compile_and_bridge` (dep: [`reelforge-render-graph`](https://crates.io/crates/reelforge-render-graph) 0.1.5):
+
+| Intelligence IR | ReelForge |
+| --- | --- |
+| `rf.adapter.sightloom` | `Op` (registry extended if missing on crate tag) |
+| `rf.redaction.region` | fused `Redaction` (empty `MaskTimeline`; host fills) |
+| `rf.transform.trim` | `Op` with `start` + `duration` |
+| `rf.transform.crop` | `Op` when `w`/`h` set; else skip (framing → host) |
+| `rf.transform.concat` | multi-range → trims + `rf.compose.layers` |
+
+Also: `schedule_graph` → `ExecutionPlan`, `HostRequest::Render.reelforge_graph_json`, MCP methods `compile_and_bridge` / `bridge_graph`.
+
+```rust
+use reelforge_intelligence_core::{
+    bridge_to_reelforge, compile_resolved, BridgeOptions,
+};
+
+let report = compile_resolved(&resolved)?;
+let ir = report.render_graph.as_ref().unwrap();
+let live = bridge_to_reelforge(ir, &BridgeOptions {
+    output_uri: Some("out.mp4".into()),
+    require_approval: true,
+    ..Default::default()
+})?;
+// host: run_render_graph(&live.graph)
+```
+
+No FFmpeg in Intelligence — only graph structure + schedule smoke.
+
 ## Status
 
-Package load → freeze → typed graph → approve gate. Next: map `RenderGraphIr` into live `reelforge::RenderGraph` / ExecutionPlan.
+Package load → freeze → typed IR → approve → **live RenderGraph bridge**. Next: MCP host binary packaging; denser masks into `MaskTimeline`.
 
 ## License
 
