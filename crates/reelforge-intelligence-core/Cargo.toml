@@ -1,0 +1,17 @@
+[package]
+name = "reelforge-intelligence-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Semantic edit contracts for ReelForge Intelligence (Milestone 0)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
