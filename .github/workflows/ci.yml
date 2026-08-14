@@ -26,6 +26,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace
+      - name: bench compile
+        run: cargo bench -p reelforge-intelligence-core --bench pipeline --no-run
       - name: cli smoke
         run: |
           cargo run -p reelforge-intelligence-cli -- version

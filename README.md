@@ -52,14 +52,67 @@ A request like *“find the most frequent person”* can change if VisionIndex u
 
 Low-level ops stay in ReelForge.
 
-## Crate
+## Crates
 
-```toml
-reelforge-intelligence-core = "0.1"
-```
+| Crate | Role |
+| --- | --- |
+| `reelforge-intelligence-core` | Intent, freeze, IDs, privacy, provider, compile, bridge |
+| `reelforge-intelligence-sightloom` | Load SightLoom package → `AnalysisSnapshot` |
+| `reelforge-intelligence-cli` | `reelforge-intelligence` binary (stdio MCP + resolve-bridge) |
 
 ```bash
-cargo test -p reelforge-intelligence-core
+cargo test --workspace
+cargo bench -p reelforge-intelligence-core --bench pipeline
+```
+
+## Competitive landscape
+
+There is **no crates.io package** that owns the same product slice: *semantic privacy/edit intent → frozen evidence pins → executable RenderGraph*. Nearby tools solve adjacent problems:
+
+| Tool / crate | What it does | What it does **not** do vs Intelligence |
+| --- | --- | --- |
+| [OpenChatCut](https://openchatcut.com) / agent NLEs | Agent + multitrack timeline UI | No VisionIndex freeze hashes; not a Rust library contract |
+| [ClipAsm](https://lib.rs/crates/clipasm) | Typed stack language for A/V graphs | No subject/privacy semantics, no analysis freeze |
+| [motionloom](https://crates.io/crates/motionloom) | Motion/scene DSL for effects | Graphics-oriented, not privacy reels from tracking |
+| [oximedia-*](https://crates.io/crates/oximedia-timeline) | Timeline / EDL collab | No SightLoom IDs, no privacy Review gate |
+| [Remotion](https://www.remotion.dev) / [Rendiv](https://github.com/thecodacus/rendiv) | React → MP4 | Code-first frames, not vision-index resolve |
+| [Shotstack](https://shotstack.io) / MoviePy / FFmpeg CLIs | Cloud or scripted edit/encode | Host executes ops; no freeze document between preview and final |
+| Commercial redaction (SAR tools, Premiere blur) | Manual or CV black-box UI | Not embeddable as intent→IR→schedule library |
+| [ReelForge](https://crates.io/crates/reelforge) + [SightLoom](https://crates.io/crates/sightloom) | Encode graph + vision memory | **Complement** this layer; Intelligence sits between them |
+
+**Differentiation:** namespaced IDs (`sightloom://…`), `ResolvedEditPlan` pins (`source_hash` / generation / index hash), privacy Review → approve, and a typed bridge into `reelforge-render-graph` with `schedule_graph` smoke — without linking FFmpeg or model weights.
+
+## Benchmarks
+
+CPU-only path (no FFmpeg, no ONNX). Measured with Criterion on a Windows development host, release profile (`cargo bench -p reelforge-intelligence-core --bench pipeline`). Times are **median-ish midpoints** from Criterion’s `[lo mid hi]` bands — re-run on your machine for CI gates.
+
+| Workload | N | Time (approx.) |
+| --- | ---: | ---: |
+| `resolve` most-frequent subject | 10 subjects | **~6 µs** |
+| `resolve` most-frequent | 100 | **~6 µs** |
+| `resolve` most-frequent | 1 000 | **~11 µs** |
+| `resolve` most-frequent | 5 000 | **~12 µs** |
+| `compile_resolved` | 100 subjects | **~18 µs** |
+| `graph_from_resolved` | 100 subjects | **~15 µs** |
+| `bridge_to_reelforge` + `schedule_graph` | IR only | **~170 µs** |
+| `bridge_resolved` + 120 mask samples + schedule | 100 subjects | **~480 µs** |
+| full `resolve → compile → bridge` | 10 / 100 / 1 000 subjects | **~200 / ~170 / ~320 µs** |
+| `mask_timeline_from_regions` | 100 samples | **~6 µs** |
+| `mask_timeline_from_regions` | 1 000 | **~74 µs** |
+| `mask_timeline_from_regions` | 10 000 | **~800 µs** |
+| IR JSON serialize / deserialize | — | **~5 µs / ~26 µs** |
+| live `RenderGraph` pretty JSON | with masks | **~240 µs** |
+
+Notes:
+
+- Resolve is essentially free at thousands of subject rows (linear scan + max).
+- Bridge + schedule dominate the handoff (~0.2–0.5 ms), still well under typical frame time.
+- Mask conversion is **O(n log n)** (batch sort). An earlier per-`push` sort path was ~1.4 s at 10 k samples; batch build dropped that to **~0.8 ms**.
+- These are **not** encode benchmarks. Pixel redaction / mux lives in [ReelForge](https://github.com/sergii-ziborov/ReelForge) (`cargo bench -p reelforge-fx`, `privacy_e2e`).
+
+```bash
+cargo bench -p reelforge-intelligence-core --bench pipeline
+# HTML: target/criterion/report/index.html
 ```
 
 ## SightLoom context (do not re-implement)
@@ -76,17 +129,6 @@ It does **not** store VisionIndex or decode video.
 | Mask handles vs region samples | **MaskFidelity**: preview = bbox proxy; final = true RLE/dense/polygon request |
 | Privacy edge cases | **PrivacyPolicy**: uncertain / missing_mask / low_confidence / track_gap |
 | Multi-source analysis | **`AnalysisProvider` trait**; first impl **`SightLoomProvider`** |
-
-## Crates
-
-| Crate | Role |
-| --- | --- |
-| `reelforge-intelligence-core` | Intent, freeze, IDs, privacy, provider trait, compile |
-| `reelforge-intelligence-sightloom` | Load SightLoom package → `AnalysisSnapshot` + `SightLoomProvider` |
-
-```bash
-cargo test -p reelforge-intelligence-sightloom
-```
 
 ## Typed RenderGraph + approve
 
@@ -105,7 +147,7 @@ Preview intent compile stays `final_graph: false`.
 | Intelligence IR | ReelForge |
 | --- | --- |
 | `rf.adapter.sightloom` | `Op` (registry extended if missing on crate tag) |
-| `rf.redaction.region` | fused `Redaction` (empty `MaskTimeline`; host fills) |
+| `rf.redaction.region` | fused `Redaction` (`MaskTimeline` from freeze when samples present) |
 | `rf.transform.trim` | `Op` with `start` + `duration` |
 | `rf.transform.crop` | `Op` when `w`/`h` set; else skip (framing → host) |
 | `rf.transform.concat` | multi-range → trims + `rf.compose.layers` |
@@ -145,13 +187,15 @@ Binary name: `reelforge-intelligence`. No FFmpeg; host runs ReelForge after hand
 `bridge_resolved` / `compile_and_bridge` convert `ResolvedMaskAsset.artifact.regions`
 into fused ReelForge `MaskTimeline` samples on redaction nodes (bbox proxy or denser host samples).
 
-## Publish
+## Publish (crates.io)
 
-CI on `main`. Tag `v*` publishes crates.io when secret `CARGO_REGISTRY_TOKEN` is set.
+Workflow: tag `v*` → `.github/workflows/publish.yml` (secret `CARGO_REGISTRY_TOKEN`).
+
+**Policy:** do not publish a version whose README lacks measured benches for that tag. Numbers above are from the `pipeline` Criterion suite on the host that cut this release branch; re-run benches before tagging.
 
 ## Status
 
-Package load → freeze → typed IR → approve → live RenderGraph + **MaskTimeline** + **CLI/MCP host**.
+Package load → freeze → typed IR → approve → live RenderGraph + MaskTimeline + CLI/MCP + **Criterion benches in README**.
 
 ## License
 

@@ -6,15 +6,22 @@ use reelforge_core::MediaTime as RfMediaTime;
 use reelforge_render_graph::{MaskSample, MaskTimeline};
 
 /// Build a fused [`MaskTimeline`] from regional samples.
+///
+/// Samples are collected then sorted once (O(n log n)) instead of per-`push`
+/// insertion on the ReelForge timeline.
 #[must_use]
 pub fn mask_timeline_from_regions(regions: &[RegionSample]) -> MaskTimeline {
-    let mut timeline = MaskTimeline::new();
+    let mut samples = Vec::with_capacity(regions.len());
     for region in regions {
         if let Some(sample) = region_to_sample(region) {
-            timeline.push(sample);
+            samples.push(sample);
         }
     }
-    timeline
+    sort_samples(&mut samples);
+    MaskTimeline {
+        samples,
+        ..MaskTimeline::new()
+    }
 }
 
 /// Fuse all materialized artifacts on a frozen plan.
@@ -26,22 +33,39 @@ pub fn mask_timeline_from_resolved(resolved: &ResolvedEditPlan) -> MaskTimeline 
 /// Fuse resolved mask assets (skips empty artifacts).
 #[must_use]
 pub fn mask_timeline_from_assets(assets: &[ResolvedMaskAsset]) -> MaskTimeline {
-    let mut timeline = MaskTimeline::new();
+    let mut samples = Vec::new();
     for asset in assets {
         if let Some(artifact) = &asset.artifact {
-            append_artifact(&mut timeline, artifact);
+            for region in &artifact.regions {
+                if let Some(sample) = region_to_sample(region) {
+                    samples.push(sample);
+                }
+            }
         }
     }
-    timeline
+    sort_samples(&mut samples);
+    MaskTimeline {
+        samples,
+        ..MaskTimeline::new()
+    }
 }
 
-/// Append one artifact's regions onto a timeline.
+/// Append one artifact's regions onto a timeline (re-sorts by time).
 pub fn append_artifact(timeline: &mut MaskTimeline, artifact: &MaskArtifact) {
     for region in &artifact.regions {
         if let Some(sample) = region_to_sample(region) {
-            timeline.push(sample);
+            timeline.samples.push(sample);
         }
     }
+    sort_samples(&mut timeline.samples);
+}
+
+fn sort_samples(samples: &mut [MaskSample]) {
+    samples.sort_by(|a, b| {
+        a.t.as_secs()
+            .partial_cmp(&b.t.as_secs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 }
 
 /// Convert a single region sample to a ReelForge mask sample.

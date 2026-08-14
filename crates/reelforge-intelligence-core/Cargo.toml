@@ -19,5 +19,12 @@ thiserror = { workspace = true }
 reelforge-core = { workspace = true }
 reelforge-render-graph = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "pipeline"
+harness = false
+
 [lints]
 workspace = true

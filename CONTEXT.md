@@ -56,7 +56,12 @@ Owns the missing layer:
 
 ## Remaining (outside Intelligence core)
 
-- crates.io tag publish (workflow ready; needs `CARGO_REGISTRY_TOKEN`)
+- crates.io tag publish (workflow + README benches ready; needs `CARGO_REGISTRY_TOKEN` + re-run benches on tag host)
 - host `run_render_graph` / encode e2e
 - SightLoom host ONNX photo→embedding (SightLoom package, not this repo)
+
+## Benchmarks
+
+`cargo bench -p reelforge-intelligence-core --bench pipeline` — resolve/compile/bridge/mask/serde.
+See README table. Mask convert is batch O(n log n).
 
