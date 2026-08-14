@@ -1,5 +1,5 @@
 [package]
-name = "reelforge-intelligence-core"
+name = "reelforge-intelligence-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,17 +7,21 @@ repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-description = "Semantic intent, freeze, compile IR, and ReelForge bridge for ReelForge Intelligence"
+description = "CLI / stdio MCP host for ReelForge Intelligence"
 keywords.workspace = true
 categories.workspace = true
-readme = "../../README.md"
+readme = "README.md"
+
+[[bin]]
+name = "reelforge-intelligence"
+path = "src/main.rs"
 
 [dependencies]
+clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
-reelforge-core = { workspace = true }
-reelforge-render-graph = { workspace = true }
+reelforge-intelligence-core = { workspace = true }
+reelforge-intelligence-sightloom = { workspace = true }
 
 [lints]
 workspace = true

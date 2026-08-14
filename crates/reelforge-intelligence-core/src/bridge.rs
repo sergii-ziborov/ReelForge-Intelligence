@@ -1,10 +1,12 @@
 //! Map Intelligence [`RenderGraphIr`] → live `reelforge_render_graph::RenderGraph`.
 //!
 //! Structural handoff only: no FFmpeg, no encode. Hosts call
-//! `compile_graph` / `schedule_graph` / `run_render_graph` after this bridge.
+//! `schedule_graph` / `run_render_graph` after this bridge.
 
 use crate::error::{IntelError, Result};
-use crate::render_graph::{GraphNodeKind, RenderGraphIr, op_id};
+use crate::mask_timeline::{mask_timeline_from_resolved, timeline_has_samples};
+use crate::render_graph::{GraphNodeKind, RenderGraphIr, graph_from_resolved, op_id};
+use crate::resolved::ResolvedEditPlan;
 use reelforge_render_graph::{
     BackendClass, CapabilitySet, ExecutionPlan, GraphOutput, MaskTimeline, MediaAsset,
     MediaAssetId, MediaContract, NodeId, OperationDescriptor, OperationId, OperationLimits,
@@ -76,21 +78,37 @@ pub struct BridgeResult {
 
 /// Convert typed Intelligence IR into a ReelForge `RenderGraph`.
 ///
+/// Prefer [`bridge_resolved`] when you still have the freeze (fills masks).
+///
 /// # Mapping
 ///
 /// | Intelligence | ReelForge |
 /// |--------------|-----------|
 /// | source / output | `Source` / `Output` + `GraphOutput` |
 /// | `rf.adapter.sightloom` | `Op` (params pass-through) |
-/// | `rf.redaction.region` | fused `Redaction` (empty masks; host/adapter fills) |
+/// | `rf.redaction.region` | fused `Redaction` (`MaskTimeline` from freeze when present) |
 /// | `rf.transform.trim` | `Op` with `start` + `duration` |
 /// | `rf.transform.crop` | `Op` when `w`/`h` present; else skip + warn |
 /// | `rf.transform.concat` | multi-range → trims + `rf.compose.layers` |
 ///
 /// # Errors
 ///
-/// Approval blocked, empty graph, invalid structure, or ReelForge compile/schedule.
+/// Approval blocked, empty graph, invalid structure, or ReelForge schedule.
 pub fn bridge_to_reelforge(ir: &RenderGraphIr, opts: &BridgeOptions) -> Result<BridgeResult> {
+    bridge_to_reelforge_with_masks(ir, opts, None)
+}
+
+/// Same as [`bridge_to_reelforge`], injecting a pre-built [`MaskTimeline`] into
+/// every redaction node (fused privacy ROI).
+///
+/// # Errors
+///
+/// Same as [`bridge_to_reelforge`].
+pub fn bridge_to_reelforge_with_masks(
+    ir: &RenderGraphIr,
+    opts: &BridgeOptions,
+    masks: Option<&MaskTimeline>,
+) -> Result<BridgeResult> {
     if opts.require_approval && !ir.approval.allows_execute() {
         return Err(IntelError::message(format!(
             "bridge: approval required ({})",
@@ -141,16 +159,11 @@ pub fn bridge_to_reelforge(ir: &RenderGraphIr, opts: &BridgeOptions) -> Result<B
                 id_map.insert(n.id.clone(), n.id.clone());
             }
             GraphNodeKind::Output => {
-                let name = n
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| "main".into());
+                let name = n.name.clone().unwrap_or_else(|| "main".into());
                 let inputs = map_inputs(&n.inputs, &id_map)?;
                 nodes.push(RenderNode {
                     id: NodeId(n.id.clone()),
-                    body: RenderNodeKind::Output {
-                        name: name.clone(),
-                    },
+                    body: RenderNodeKind::Output { name: name.clone() },
                     inputs,
                 });
                 id_map.insert(n.id.clone(), n.id.clone());
@@ -164,11 +177,24 @@ pub fn bridge_to_reelforge(ir: &RenderGraphIr, opts: &BridgeOptions) -> Result<B
                 let prev = inputs.first().cloned();
                 match op {
                     op_id::REDACTION_REGION => {
+                        let timeline = masks.cloned().unwrap_or_else(MaskTimeline::new);
+                        if timeline_has_samples(&timeline) {
+                            warnings.push(format!(
+                                "{}: redaction with {} mask samples",
+                                n.id,
+                                timeline.samples.len()
+                            ));
+                        } else {
+                            warnings.push(format!(
+                                "{}: redaction empty MaskTimeline (host/adapter should fill)",
+                                n.id
+                            ));
+                        }
                         nodes.push(RenderNode {
                             id: NodeId(n.id.clone()),
                             body: RenderNodeKind::Redaction {
                                 redaction: RegionRedaction::gaussian(
-                                    MaskTimeline::new(),
+                                    timeline,
                                     opts.redaction_sigma,
                                 ),
                             },
@@ -189,8 +215,10 @@ pub fn bridge_to_reelforge(ir: &RenderGraphIr, opts: &BridgeOptions) -> Result<B
                         id_map.insert(n.id.clone(), n.id.clone());
                     }
                     op_id::TRANSFORM_TRIM => {
-                        let (params, note) =
-                            normalize_trim_params(n.params.as_ref(), opts.default_trim_duration_secs);
+                        let (params, note) = normalize_trim_params(
+                            n.params.as_ref(),
+                            opts.default_trim_duration_secs,
+                        );
                         if let Some(note) = note {
                             warnings.push(format!("{}: {note}", n.id));
                         }
@@ -246,10 +274,8 @@ pub fn bridge_to_reelforge(ir: &RenderGraphIr, opts: &BridgeOptions) -> Result<B
                             if let Some(note) = note {
                                 warnings.push(format!("{}: {note}", n.id));
                             }
-                            warnings.push(format!(
-                                "{}: concat→trim (single range / whole span)",
-                                n.id
-                            ));
+                            warnings
+                                .push(format!("{}: concat→trim (single range / whole span)", n.id));
                             nodes.push(RenderNode {
                                 id: NodeId(n.id.clone()),
                                 body: RenderNodeKind::Op {
@@ -585,12 +611,45 @@ pub fn bridge_default(ir: &RenderGraphIr) -> Result<BridgeResult> {
 /// # Errors
 ///
 /// Approval or conversion failure.
-pub fn bridge_for_execute(
-    ir: &RenderGraphIr,
-    output_uri: Option<String>,
-) -> Result<BridgeResult> {
+pub fn bridge_for_execute(ir: &RenderGraphIr, output_uri: Option<String>) -> Result<BridgeResult> {
     bridge_to_reelforge(
         ir,
+        &BridgeOptions {
+            output_uri,
+            require_approval: true,
+            ..BridgeOptions::default()
+        },
+    )
+}
+
+/// Compile-path from freeze: build IR + inject mask samples from resolved artifacts.
+///
+/// # Errors
+///
+/// Validation / bridge failure.
+pub fn bridge_resolved(resolved: &ResolvedEditPlan, opts: &BridgeOptions) -> Result<BridgeResult> {
+    resolved.validate()?;
+    let ir = graph_from_resolved(resolved);
+    let masks = mask_timeline_from_resolved(resolved);
+    let mask_ref = if timeline_has_samples(&masks) {
+        Some(&masks)
+    } else {
+        None
+    };
+    bridge_to_reelforge_with_masks(&ir, opts, mask_ref)
+}
+
+/// Approval-gated bridge from freeze (for host execute).
+///
+/// # Errors
+///
+/// Approval or bridge failure.
+pub fn bridge_resolved_for_execute(
+    resolved: &ResolvedEditPlan,
+    output_uri: Option<String>,
+) -> Result<BridgeResult> {
+    bridge_resolved(
+        resolved,
         &BridgeOptions {
             output_uri,
             require_approval: true,
@@ -645,19 +704,13 @@ mod tests {
         .unwrap();
         assert!(!result.graph.nodes.is_empty());
         assert!(result.execution_plan.is_some());
-        assert!(
-            result
-                .graph
-                .nodes
-                .iter()
-                .any(|n| matches!(
-                    &n.body,
-                    RenderNodeKind::Op {
-                        operation,
-                        ..
-                    } if operation.0 == op_id::ADAPTER_SIGHTLOOM
-                ))
-        );
+        assert!(result.graph.nodes.iter().any(|n| matches!(
+            &n.body,
+            RenderNodeKind::Op {
+                operation,
+                ..
+            } if operation.0 == op_id::ADAPTER_SIGHTLOOM
+        )));
         let json = &result.graph_json;
         assert!(json.contains("rf.adapter.sightloom") || json.contains("adapter"));
         assert_eq!(result.graph.outputs[0].uri.as_deref(), Some("out.mp4"));
@@ -683,6 +736,45 @@ mod tests {
     }
 
     #[test]
+    fn bridge_resolved_fills_mask_samples() {
+        use crate::mask::{MaskArtifact, RegionSample};
+        use crate::resolved::ResolvedMaskAsset;
+        use crate::time::{MediaRange, MediaTime};
+
+        let intent = SemanticEditPlan::new("cam1").with_edit(SemanticEdit::BlurSubject {
+            subject: crate::selector::SubjectSelector::MostFrequent {
+                metric: FrequencyMetric::AppearanceCount,
+            },
+        });
+        let mut resolved = resolve_plan(&intent, &snap(), IntelligencePolicy::default()).unwrap();
+        resolved.resolved_masks.push(ResolvedMaskAsset {
+            mask_id: None,
+            mask_ref: None,
+            subject: resolved.resolved_subjects.first().map(|s| s.id.clone()),
+            range: Some(MediaRange::new(
+                MediaTime::new(0, 1_000_000_000),
+                MediaTime::new(5_000_000_000, 1_000_000_000),
+            )),
+            fidelity: crate::mask::MaskFidelity::BBoxProxy,
+            artifact: Some(MaskArtifact::from_regions(vec![RegionSample {
+                at: MediaTime::new(0, 1_000_000_000),
+                box_xyxy: [100.0, 100.0, 200.0, 300.0],
+                subject: resolved.resolved_subjects.first().map(|s| s.id.clone()),
+                confidence: Some(0.95),
+            }])),
+        });
+        let result = bridge_resolved(&resolved, &BridgeOptions::default()).unwrap();
+        let redaction = result.graph.nodes.iter().find_map(|n| match &n.body {
+            RenderNodeKind::Redaction { redaction } => Some(redaction),
+            _ => None,
+        });
+        let redaction = redaction.expect("redaction node");
+        assert_eq!(redaction.masks.samples.len(), 1);
+        assert_eq!(redaction.masks.samples[0].left, Some(100.0));
+        assert!(result.warnings.iter().any(|w| w.contains("mask samples")));
+    }
+
+    #[test]
     fn bridge_for_execute_blocks_without_approval() {
         let intent =
             SemanticEditPlan::new("cam1").with_edit(SemanticEdit::BuildMostFrequentSubjectReel {
@@ -702,7 +794,7 @@ mod tests {
     #[test]
     fn multi_range_concat_expands_to_layers() {
         use crate::render_graph::{
-            GraphAsset, GraphNode, GraphNodeKind, INTEL_RENDER_GRAPH_VERSION, ApprovalRecord,
+            ApprovalRecord, GraphAsset, GraphNode, GraphNodeKind, INTEL_RENDER_GRAPH_VERSION,
         };
         let ir = RenderGraphIr {
             version: INTEL_RENDER_GRAPH_VERSION,
@@ -761,16 +853,10 @@ mod tests {
             note: None,
         };
         let result = bridge_default(&ir).unwrap();
-        assert!(
-            result
-                .graph
-                .nodes
-                .iter()
-                .any(|n| matches!(
-                    &n.body,
-                    RenderNodeKind::Op { operation, .. } if operation.0 == "rf.compose.layers"
-                ))
-        );
+        assert!(result.graph.nodes.iter().any(|n| matches!(
+            &n.body,
+            RenderNodeKind::Op { operation, .. } if operation.0 == "rf.compose.layers"
+        )));
         assert!(result.execution_plan.is_some());
     }
 }

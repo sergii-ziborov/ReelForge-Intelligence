@@ -1,6 +1,8 @@
 //! P4 Intelligence contract. MCP must only dispatch these methods.
 
-use crate::bridge::{BridgeOptions, BridgeResult, bridge_for_execute, bridge_to_reelforge};
+use crate::bridge::{
+    BridgeOptions, BridgeResult, bridge_resolved, bridge_resolved_for_execute, bridge_to_reelforge,
+};
 use crate::catalog::{HostCatalog, MediaInspection, SceneHit, SubjectHit};
 use crate::compile::{
     CompileReport, approve_compile, attach_reelforge_bridge, compile_and_bridge, compile_resolved,
@@ -268,20 +270,8 @@ impl IntelligenceService {
             .intent
             .as_ref()
             .and_then(|i| i.target_output.clone());
-        let reelforge_graph_json = report
-            .render_graph
-            .as_ref()
-            .and_then(|ir| {
-                bridge_to_reelforge(
-                    ir,
-                    &BridgeOptions {
-                        output_uri: output.clone(),
-                        require_approval: true,
-                        ..BridgeOptions::default()
-                    },
-                )
-                .ok()
-            })
+        let reelforge_graph_json = bridge_resolved_for_execute(resolved, output.clone())
+            .ok()
             .map(|b| b.graph_json);
         Ok(HostRequest::Render {
             media: resolved.media.clone(),
@@ -318,31 +308,29 @@ impl IntelligenceService {
             .intent
             .as_ref()
             .and_then(|i| i.target_output.clone());
-        if let Some(ref ir) = report.render_graph {
-            match bridge_for_execute(ir, output.clone()) {
-                Ok(bridged) => {
-                    report.reelforge_graph_json = Some(bridged.graph_json.clone());
-                    report.bridge_warnings = bridged.warnings;
-                    let req = HostRequest::Render {
-                        media: resolved.media.clone(),
-                        output,
-                        resolved_plan: Some(Box::new(resolved.clone())),
-                        reelforge_graph_json: Some(bridged.graph_json),
-                    };
-                    return Ok((report, req));
-                }
-                Err(e) => {
-                    report.bridge_warnings.push(format!("bridge: {e}"));
-                }
+        match bridge_resolved_for_execute(resolved, output.clone()) {
+            Ok(bridged) => {
+                report.reelforge_graph_json = Some(bridged.graph_json.clone());
+                report.bridge_warnings = bridged.warnings;
+                let req = HostRequest::Render {
+                    media: resolved.media.clone(),
+                    output,
+                    resolved_plan: Some(Box::new(resolved.clone())),
+                    reelforge_graph_json: Some(bridged.graph_json),
+                };
+                Ok((report, req))
+            }
+            Err(e) => {
+                report.bridge_warnings.push(format!("bridge: {e}"));
+                let req = HostRequest::Render {
+                    media: resolved.media.clone(),
+                    output,
+                    resolved_plan: Some(Box::new(resolved.clone())),
+                    reelforge_graph_json: report.reelforge_graph_json.clone(),
+                };
+                Ok((report, req))
             }
         }
-        let req = HostRequest::Render {
-            media: resolved.media.clone(),
-            output,
-            resolved_plan: Some(Box::new(resolved.clone())),
-            reelforge_graph_json: report.reelforge_graph_json.clone(),
-        };
-        Ok((report, req))
     }
 
     /// Bridge a typed IR into a live ReelForge graph (+ optional schedule).
@@ -350,12 +338,21 @@ impl IntelligenceService {
     /// # Errors
     ///
     /// Bridge / validate / schedule failure.
-    pub fn bridge_graph(
+    pub fn bridge_graph(&self, ir: &RenderGraphIr, opts: &BridgeOptions) -> Result<BridgeResult> {
+        bridge_to_reelforge(ir, opts)
+    }
+
+    /// Bridge from frozen plan (fills `MaskTimeline` from resolved mask artifacts).
+    ///
+    /// # Errors
+    ///
+    /// Bridge failure.
+    pub fn bridge_resolved(
         &self,
-        ir: &RenderGraphIr,
+        resolved: &ResolvedEditPlan,
         opts: &BridgeOptions,
     ) -> Result<BridgeResult> {
-        bridge_to_reelforge(ir, opts)
+        bridge_resolved(resolved, opts)
     }
 
     /// Compile frozen plan and bridge to ReelForge in one step.

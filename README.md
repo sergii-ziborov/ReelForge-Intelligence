@@ -129,9 +129,29 @@ let live = bridge_to_reelforge(ir, &BridgeOptions {
 
 No FFmpeg in Intelligence — only graph structure + schedule smoke.
 
+## CLI / MCP host
+
+```bash
+cargo run -p reelforge-intelligence-cli -- methods
+cargo run -p reelforge-intelligence-cli -- serve          # line JSON on stdio
+cargo run -p reelforge-intelligence-cli -- resolve-bridge \
+  --package /path/to/vision_index --plan intent.json --write-graph out_graph.json
+```
+
+Binary name: `reelforge-intelligence`. No FFmpeg; host runs ReelForge after handoff.
+
+## Masks → MaskTimeline
+
+`bridge_resolved` / `compile_and_bridge` convert `ResolvedMaskAsset.artifact.regions`
+into fused ReelForge `MaskTimeline` samples on redaction nodes (bbox proxy or denser host samples).
+
+## Publish
+
+CI on `main`. Tag `v*` publishes crates.io when secret `CARGO_REGISTRY_TOKEN` is set.
+
 ## Status
 
-Package load → freeze → typed IR → approve → **live RenderGraph bridge**. Next: MCP host binary packaging; denser masks into `MaskTimeline`.
+Package load → freeze → typed IR → approve → live RenderGraph + **MaskTimeline** + **CLI/MCP host**.
 
 ## License
 

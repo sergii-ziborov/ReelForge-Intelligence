@@ -6,6 +6,36 @@ use crate::error::{IntelError, Result};
 use crate::service::IntelligenceService;
 use serde_json::Value;
 
+/// Known Intelligence MCP method names (stdio host / tools catalog).
+pub const METHODS: &[&str] = &[
+    "operations",
+    "schemas",
+    "list_methods",
+    "inspect_media",
+    "catalog_scenes",
+    "catalog_subjects",
+    "check_plan",
+    "normalize_plan",
+    "repair_plan",
+    "compile_plan",
+    "resolve_plan",
+    "compile_resolved",
+    "resolve_and_compile",
+    "explain_plan",
+    "preview_frame",
+    "render",
+    "render_resolved",
+    "approve_and_render",
+    "compile_and_bridge",
+    "bridge_graph",
+];
+
+/// List supported method names.
+#[must_use]
+pub fn list_methods() -> &'static [&'static str] {
+    METHODS
+}
+
 /// Dispatch one MCP-style call. Unknown methods error.
 ///
 /// # Errors
@@ -14,6 +44,7 @@ use serde_json::Value;
 pub fn dispatch(svc: &IntelligenceService, method: &str, args: &Value) -> Result<Value> {
     match method {
         "operations" => Ok(serde_json::to_value(svc.operations()).unwrap_or(Value::Null)),
+        "list_methods" => Ok(serde_json::to_value(list_methods()).unwrap_or(Value::Null)),
         "schemas" => Ok(svc.schemas()),
         "inspect_media" => {
             let media = arg_str(args, "media")?;

@@ -3,7 +3,7 @@
 //! Compiling raw [`crate::SemanticEditPlan`] without freeze is for **preview**
 //! only and is marked non-final.
 
-use crate::bridge::{BridgeOptions, BridgeResult, bridge_to_reelforge};
+use crate::bridge::{BridgeOptions, BridgeResult, bridge_resolved, bridge_to_reelforge};
 use crate::error::IntelError;
 use crate::render_graph::{
     ApprovalRecord, RenderGraphIr, approval_for_resolved, approve, graph_from_resolved,
@@ -174,6 +174,8 @@ pub fn attach_reelforge_bridge(
 
 /// Compile frozen plan and immediately bridge to ReelForge.
 ///
+/// Injects `MaskTimeline` samples from `resolved.resolved_masks` when present.
+///
 /// # Errors
 ///
 /// Compile or bridge failure.
@@ -181,13 +183,8 @@ pub fn compile_and_bridge(
     resolved: &ResolvedEditPlan,
     opts: &BridgeOptions,
 ) -> crate::Result<(CompileReport, BridgeResult)> {
-    let report = compile_resolved(resolved)?;
-    let ir = report
-        .render_graph
-        .as_ref()
-        .ok_or_else(|| IntelError::message("compile_and_bridge: missing IR"))?;
-    let bridged = bridge_to_reelforge(ir, opts)?;
-    let mut report = report;
+    let mut report = compile_resolved(resolved)?;
+    let bridged = bridge_resolved(resolved, opts)?;
     report.reelforge_graph_json = Some(bridged.graph_json.clone());
     report.bridge_warnings.clone_from(&bridged.warnings);
     Ok((report, bridged))

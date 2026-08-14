@@ -18,7 +18,7 @@
 //!   → ResolvedEditPlan          (frozen, namespaced IDs)
 //!   → compile_resolved          (typed RenderGraphIr + JSON)
 //!   → approve (if privacy Review)
-//!   → bridge_to_reelforge        (live reelforge::RenderGraph + schedule)
+//!   → bridge_resolved            (live RenderGraph + MaskTimeline + schedule)
 //!   → ReelForge execute
 //! ```
 //!
@@ -31,7 +31,8 @@
     clippy::too_many_lines,
     clippy::unnecessary_wraps,
     clippy::collapsible_if,
-    clippy::needless_lifetimes
+    clippy::needless_lifetimes,
+    clippy::manual_midpoint
 )]
 
 mod bridge;
@@ -41,6 +42,7 @@ mod edit;
 mod error;
 mod ids;
 mod mask;
+mod mask_timeline;
 mod mcp;
 mod ops;
 mod policy;
@@ -55,7 +57,8 @@ mod sightloom_provider;
 mod time;
 
 pub use bridge::{
-    BridgeOptions, BridgeResult, bridge_default, bridge_for_execute, bridge_to_reelforge,
+    BridgeOptions, BridgeResult, bridge_default, bridge_for_execute, bridge_resolved,
+    bridge_resolved_for_execute, bridge_to_reelforge, bridge_to_reelforge_with_masks,
 };
 pub use catalog::{HostCatalog, MediaInspection, SceneHit, SubjectHit};
 pub use compile::AnalysisProvider as AnalysisProviderDescriptor;
@@ -70,7 +73,11 @@ pub use edit::{
 pub use error::{IntelError, Result};
 pub use ids::{AnalysisNamespace, EntityKind, NamespacedId};
 pub use mask::{MaskArtifact, MaskFidelity, MaskGeometry, MaskRequest, RegionSample};
-pub use mcp::{dispatch, service_with_catalog};
+pub use mask_timeline::{
+    append_artifact, mask_timeline_from_assets, mask_timeline_from_regions,
+    mask_timeline_from_resolved, region_to_sample, timeline_has_samples,
+};
+pub use mcp::{dispatch, list_methods, service_with_catalog};
 pub use ops::{IntelOperation, edit_op_id, operations, schemas};
 pub use policy::{
     GapAction, IntelligencePolicy, LowConfidenceAction, MissingMaskAction, PrivacyPolicy,

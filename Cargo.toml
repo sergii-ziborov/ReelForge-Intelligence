@@ -2,6 +2,12 @@
 members = [
     "crates/reelforge-intelligence-core",
     "crates/reelforge-intelligence-sightloom",
+    "crates/reelforge-intelligence-cli",
+]
+default-members = [
+    "crates/reelforge-intelligence-core",
+    "crates/reelforge-intelligence-sightloom",
+    "crates/reelforge-intelligence-cli",
 ]
 resolver = "3"
 
@@ -12,12 +18,19 @@ license = "MIT"
 repository = "https://github.com/sergii-ziborov/ReelForge-Intelligence"
 rust-version = "1.97"
 authors = ["Sergii Ziborov"]
+homepage = "https://github.com/sergii-ziborov/ReelForge-Intelligence"
+keywords = ["video", "intelligence", "sightloom", "reelforge", "mcp"]
+categories = ["multimedia", "multimedia::video"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+reelforge-core = "0.1.5"
 reelforge-render-graph = "0.1.5"
+reelforge-intelligence-core = { path = "crates/reelforge-intelligence-core", version = "0.1.0" }
+reelforge-intelligence-sightloom = { path = "crates/reelforge-intelligence-sightloom", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

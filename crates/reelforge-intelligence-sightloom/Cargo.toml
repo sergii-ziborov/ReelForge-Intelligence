@@ -4,9 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 description = "SightLoom VisionIndex package → AnalysisSnapshot for ReelForge Intelligence"
+keywords.workspace = true
+categories.workspace = true
 readme = "README.md"
 
 [dependencies]

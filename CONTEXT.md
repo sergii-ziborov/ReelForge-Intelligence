@@ -51,6 +51,12 @@ Owns the missing layer:
 2. ~~Stronger RenderGraph schema~~ **done** (`RenderGraphIr` + op ids)  
 3. ~~Approve workflow~~ **done** (`ApprovalRecord`, `approve_and_render`)  
 4. ~~Map `RenderGraphIr` → live `reelforge::RenderGraph` / schedule~~ **done**  
-5. MCP host binary packaging  
-6. Optional: denser mask materialization into `MaskTimeline` before redaction
+5. ~~MCP host binary packaging~~ **done** (`reelforge-intelligence-cli`)  
+6. ~~Mask regions → `MaskTimeline` on redaction~~ **done** (`mask_timeline` + `bridge_resolved`)  
+
+## Remaining (outside Intelligence core)
+
+- crates.io tag publish (workflow ready; needs `CARGO_REGISTRY_TOKEN`)
+- host `run_render_graph` / encode e2e
+- SightLoom host ONNX photo→embedding (SightLoom package, not this repo)
 
