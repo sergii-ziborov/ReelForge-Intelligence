@@ -35,8 +35,16 @@ Owns the missing layer:
 - FFmpeg encode
 - VisionIndex storage format
 
+## Technical bridges (done)
+
+1. **Namespaced IDs** — `NamespacedId` / `sightloom://…`  
+2. **Mask domains** — `MaskFidelity`, `MaskRequest`, `MaskArtifact`  
+3. **PrivacyPolicy** — uncertain, missing_mask, low_confidence, track_gap  
+4. **`AnalysisProvider` trait** + **`SightLoomProvider`** over `AnalysisSnapshot`
+
 ## Next milestones
 
-1. `sightloom` feature: fill `AnalysisSnapshot` from `IndexSession` / package load  
+1. Fill `AnalysisSnapshot` from real SightLoom package load  
 2. Stronger RenderGraph schema shared with ReelForge  
 3. MCP host binary + approve workflow  
+

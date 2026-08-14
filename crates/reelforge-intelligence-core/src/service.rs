@@ -4,10 +4,12 @@ use crate::catalog::{HostCatalog, MediaInspection, SceneHit, SubjectHit};
 use crate::compile::{CompileReport, compile_resolved};
 use crate::edit::SemanticEditPlan;
 use crate::error::{IntelError, Result};
+use crate::mask::{MaskArtifact, MaskRequest};
 use crate::ops::{IntelOperation, edit_op_id, operations, schemas};
 use crate::policy::{IntelligencePolicy, UncertaintyPolicy};
+use crate::provider::AnalysisProvider;
 use crate::resolve::{AnalysisSnapshot, resolve_plan};
-use crate::resolved::ResolvedEditPlan;
+use crate::resolved::{ResolvedEditPlan, ResolvedMaskAsset};
 use crate::selector::SubjectSelector;
 use serde::{Deserialize, Serialize};
 
@@ -268,6 +270,42 @@ impl IntelligenceService {
         let resolved = self.resolve_plan(intent, analysis)?;
         let report = self.compile_resolved(&resolved)?;
         Ok((resolved, report))
+    }
+
+    /// Materialize masks via any [`AnalysisProvider`] (preview vs final fidelity).
+    ///
+    /// # Errors
+    ///
+    /// Provider errors.
+    pub fn materialize_masks<P: AnalysisProvider>(
+        &self,
+        provider: &P,
+        request: &MaskRequest,
+    ) -> Result<MaskArtifact> {
+        provider.materialize_masks(request)
+    }
+
+    /// Attach a mask artifact onto a frozen plan (host step after resolve).
+    #[must_use]
+    pub fn with_mask_artifact(
+        &self,
+        mut resolved: ResolvedEditPlan,
+        artifact: MaskArtifact,
+    ) -> ResolvedEditPlan {
+        let subjects: Vec<_> = resolved
+            .resolved_subjects
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        resolved.resolved_masks.push(ResolvedMaskAsset {
+            mask_id: subjects.first().cloned(),
+            mask_ref: None,
+            subject: subjects.first().cloned(),
+            range: resolved.resolved_ranges.first().copied(),
+            fidelity: artifact.fidelity,
+            artifact: Some(artifact),
+        });
+        resolved
     }
 }
 

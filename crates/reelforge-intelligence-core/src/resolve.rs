@@ -2,6 +2,7 @@
 
 use crate::edit::{FrequencyMetric, SemanticEdit, SemanticEditPlan};
 use crate::error::{IntelError, Result};
+use crate::ids::NamespacedId;
 use crate::policy::IntelligencePolicy;
 use crate::resolved::{
     ResolutionDecision, ResolutionWarning, ResolvedEditPlan, ResolvedEvent, ResolvedSubject,
@@ -131,10 +132,14 @@ pub fn resolve_plan(
             }
             SemanticEdit::BlurEveryoneExcept { allowed, .. } => {
                 let allowed_ids = select_subjects(allowed, analysis, edit_index, &mut resolved)?;
-                let allowed_set: Vec<u64> = allowed_ids.iter().map(|s| s.subject_id).collect();
+                let allowed_set: Vec<u64> = allowed_ids
+                    .iter()
+                    .filter_map(|s| s.local_subject_id)
+                    .collect();
+                let index = index_key(analysis);
                 for s in &analysis.subjects {
                     if !allowed_set.contains(&s.subject_id) {
-                        resolved.resolved_subjects.push(to_resolved(s, ts));
+                        resolved.resolved_subjects.push(to_resolved(s, ts, index));
                     }
                 }
                 resolved.decisions.push(ResolutionDecision {
@@ -154,13 +159,16 @@ pub fn resolve_plan(
                     });
                     continue;
                 };
-                resolved.resolved_subjects.push(to_resolved(best, ts));
-                push_subject_ranges(&[to_resolved(best, ts)], ts, &mut resolved);
+                let index = index_key(analysis);
+                let rs = to_resolved(best, ts, index);
+                resolved.resolved_subjects.push(rs.clone());
+                push_subject_ranges(&[rs], ts, &mut resolved);
                 resolved.decisions.push(ResolutionDecision {
                     code: "most_frequent".into(),
                     message: format!(
                         "subject {} appearances={}",
-                        best.subject_id, best.appearance_count
+                        NamespacedId::sightloom_subject(index, best.subject_id).as_uri(),
+                        best.appearance_count
                     ),
                     edit_index: Some(edit_index),
                 });
@@ -177,11 +185,14 @@ pub fn resolve_plan(
                         edit_index: Some(edit_index),
                     });
                 }
+                let index = index_key(analysis);
                 for a in hits {
                     resolved.resolved_events.push(ResolvedEvent {
-                        event_id: a.anomaly_id.clone(),
+                        event_id: format!("sightloom://{index}/events/{}", a.anomaly_id),
                         kind: a.kind.clone(),
-                        subject_id: a.subject_id,
+                        subject: a
+                            .subject_id
+                            .map(|s| NamespacedId::sightloom_subject(index, s)),
                         range: MediaRange::new(
                             MediaTime::new(a.start_ticks, ts),
                             MediaTime::new(a.end_ticks, ts),
@@ -218,11 +229,26 @@ pub fn resolve_plan(
     Ok(resolved)
 }
 
-fn to_resolved(s: &SubjectEvidence, ts: u32) -> ResolvedSubject {
+fn index_key(analysis: &AnalysisSnapshot) -> &str {
+    if analysis.vision_index_generation.is_empty() {
+        "unknown"
+    } else {
+        &analysis.vision_index_generation
+    }
+}
+
+fn to_resolved(s: &SubjectEvidence, ts: u32, index_id: &str) -> ResolvedSubject {
+    let source_uris: Vec<NamespacedId> = s
+        .source_ids
+        .iter()
+        .map(|src| NamespacedId::sightloom_source(index_id, *src))
+        .collect();
     ResolvedSubject {
-        subject_id: s.subject_id,
+        id: NamespacedId::sightloom_subject(index_id, s.subject_id),
+        local_subject_id: Some(s.subject_id),
         label: s.label.clone(),
         source_ids: s.source_ids.clone(),
+        source_uris,
         span: Some(MediaRange::new(
             MediaTime::new(s.first_ticks, ts),
             MediaTime::new(s.last_ticks, ts),
@@ -287,12 +313,13 @@ fn select_subjects(
     resolved: &mut ResolvedEditPlan,
 ) -> Result<Vec<ResolvedSubject>> {
     let ts = analysis.timescale.max(1);
+    let index = index_key(analysis);
     let list = match selector {
         SubjectSelector::SubjectIds { ids } => analysis
             .subjects
             .iter()
             .filter(|s| ids.contains(&s.subject_id))
-            .map(|s| to_resolved(s, ts))
+            .map(|s| to_resolved(s, ts, index))
             .collect::<Vec<_>>(),
         SubjectSelector::SubjectSet { name } => {
             // Host policy maps sets; without mapping, warn and match labels.
@@ -305,7 +332,7 @@ fn select_subjects(
                         .as_ref()
                         .is_some_and(|l| l.to_lowercase().contains(&lower))
                 })
-                .map(|s| to_resolved(s, ts))
+                .map(|s| to_resolved(s, ts, index))
                 .collect();
             if hits.is_empty() {
                 resolved.warnings.push(ResolutionWarning {
@@ -334,16 +361,12 @@ fn select_subjects(
             Vec::new()
         }
         SubjectSelector::MostFrequent { metric } => most_frequent(analysis, *metric)
-            .map(|s| vec![to_resolved(s, ts)])
+            .map(|s| vec![to_resolved(s, ts, index)])
             .unwrap_or_default(),
     };
 
     for s in &list {
-        if !resolved
-            .resolved_subjects
-            .iter()
-            .any(|x| x.subject_id == s.subject_id)
-        {
+        if !resolved.resolved_subjects.iter().any(|x| x.id == s.id) {
             resolved.resolved_subjects.push(s.clone());
         }
     }
@@ -408,7 +431,10 @@ mod tests {
             });
         let resolved = resolve_plan(&intent, &snap(), IntelligencePolicy::default()).unwrap();
         assert_eq!(resolved.resolved_subjects.len(), 1);
-        assert_eq!(resolved.resolved_subjects[0].subject_id, 2);
+        assert_eq!(
+            resolved.resolved_subjects[0].id.as_uri(),
+            "sightloom://gen-00000001/subjects/2"
+        );
         assert_eq!(resolved.vision_index_hash, "idx-xyz");
     }
 

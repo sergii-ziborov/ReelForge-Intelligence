@@ -66,9 +66,18 @@ Intelligence **queries** what SightLoom already provides: subject queries, appea
 
 It does **not** store VisionIndex or decode video.
 
+## Technical bridges (v0.1)
+
+| Problem | Solution |
+| --- | --- |
+| SightLoom `SubjectId(u64)` vs ReelForge `String` | **Namespaced IDs**: `sightloom://{gen}/subjects/184`, `…/sources/2/tracks/91` |
+| Mask handles vs region samples | **MaskFidelity**: preview = bbox proxy; final = true RLE/dense/polygon request |
+| Privacy edge cases | **PrivacyPolicy**: uncertain / missing_mask / low_confidence / track_gap |
+| Multi-source analysis | **`AnalysisProvider` trait**; first impl **`SightLoomProvider`** |
+
 ## Status
 
-Public repo bootstrap. Core contracts + resolve + final compile stub. Host adapters that open real VisionIndex packages land next.
+Core contracts + namespaced IDs + privacy policy + provider interface + resolve/compile. Next: load real VisionIndex packages into `AnalysisSnapshot`.
 
 ## License
 

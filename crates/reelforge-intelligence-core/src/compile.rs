@@ -6,18 +6,9 @@
 use crate::resolved::ResolvedEditPlan;
 use serde::{Deserialize, Serialize};
 
-/// Host-provided analysis capability (`SightLoom`, activity, …).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AnalysisProvider {
-    /// Provider id (`sightloom`, `capture_events`, …).
-    pub id: String,
-    /// Human label.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    /// Capability tags.
-    #[serde(default)]
-    pub capabilities: Vec<String>,
-}
+// Analysis provider **trait** lives in `provider.rs`.
+// Re-export info type for catalogs under the old name for compatibility.
+pub use crate::provider::AnalysisProviderInfo as AnalysisProvider;
 
 /// Non-fatal compile note.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,7 +103,7 @@ pub fn compile_resolved(resolved: &ResolvedEditPlan) -> crate::Result<CompileRep
             "kind": "op",
             "operation": "rf.redaction.region",
             "inputs": [prev],
-            "subjects": resolved.resolved_subjects.iter().map(|s| s.subject_id).collect::<Vec<_>>(),
+            "subjects": resolved.resolved_subjects.iter().map(|s| s.id.as_uri()).collect::<Vec<_>>(),
             "ranges": resolved.resolved_ranges.len(),
             "masks": resolved.resolved_masks.len(),
             "note": "host binds TrackTimeline / MaskTimeline from frozen resolution",

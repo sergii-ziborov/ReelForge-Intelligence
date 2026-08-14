@@ -5,24 +5,32 @@
 
 use crate::edit::SemanticEditPlan;
 use crate::error::{IntelError, Result};
+use crate::ids::NamespacedId;
+use crate::mask::{MaskArtifact, MaskFidelity};
 use crate::policy::IntelligencePolicy;
 use crate::time::{MediaRange, MediaTime};
 use serde::{Deserialize, Serialize};
 
 /// Schema version for [`ResolvedEditPlan`].
-pub const RESOLVED_EDIT_PLAN_VERSION: u32 = 1;
+pub const RESOLVED_EDIT_PLAN_VERSION: u32 = 2;
 
 /// One subject identity frozen from SightLoom (or host catalog).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedSubject {
-    /// Stable subject id (`VisionIndex` / gallery).
-    pub subject_id: u64,
+    /// Namespaced subject id for ReelForge (`sightloom://…/subjects/184`).
+    pub id: NamespacedId,
+    /// Raw numeric id inside the VisionIndex (debug / host map).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_subject_id: Option<u64>,
     /// Optional human label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// Sources where the subject appears.
+    /// Sources where the subject appears (raw source numbers).
     #[serde(default)]
     pub source_ids: Vec<u32>,
+    /// Namespaced source ids when frozen.
+    #[serde(default)]
+    pub source_uris: Vec<NamespacedId>,
     /// Appearance span when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<MediaRange>,
@@ -34,28 +42,38 @@ pub struct ResolvedSubject {
 /// One event / anomaly / visit frozen for the plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedEvent {
-    /// Event id or synthetic key.
+    /// Event id (preferably namespaced URI).
     pub event_id: String,
     /// Kind tag (`appearance`, `anomaly`, `visit`, …).
     pub kind: String,
-    /// Optional subject scope.
+    /// Optional namespaced subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject_id: Option<u64>,
+    pub subject: Option<NamespacedId>,
     /// Time range.
     pub range: MediaRange,
 }
 
-/// Mask / redaction asset handle frozen from host or VisionIndex.
+/// Mask / redaction asset frozen from host or VisionIndex.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedMaskAsset {
-    /// Host or index mask ref / path key.
-    pub mask_ref: String,
-    /// Optional subject.
+    /// Namespaced mask id when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject_id: Option<u64>,
+    pub mask_id: Option<NamespacedId>,
+    /// Host or index mask ref / path key (legacy string).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_ref: Option<String>,
+    /// Optional namespaced subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<NamespacedId>,
     /// Valid range.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<MediaRange>,
+    /// Fidelity used for this asset.
+    #[serde(default)]
+    pub fidelity: MaskFidelity,
+    /// Materialized artifact (preview bbox or true geometry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<MaskArtifact>,
 }
 
 /// Why a subject/event was chosen or rejected.
