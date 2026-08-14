@@ -44,7 +44,8 @@ Owns the missing layer:
 
 ## Next milestones
 
-1. Fill `AnalysisSnapshot` from real SightLoom package load  
+1. ~~Fill `AnalysisSnapshot` from real SightLoom package~~ **done** (`reelforge-intelligence-sightloom`)  
 2. Stronger RenderGraph schema shared with ReelForge  
 3. MCP host binary + approve workflow  
+
 

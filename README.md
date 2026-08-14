@@ -75,9 +75,20 @@ It does **not** store VisionIndex or decode video.
 | Privacy edge cases | **PrivacyPolicy**: uncertain / missing_mask / low_confidence / track_gap |
 | Multi-source analysis | **`AnalysisProvider` trait**; first impl **`SightLoomProvider`** |
 
+## Crates
+
+| Crate | Role |
+| --- | --- |
+| `reelforge-intelligence-core` | Intent, freeze, IDs, privacy, provider trait, compile |
+| `reelforge-intelligence-sightloom` | Load SightLoom package → `AnalysisSnapshot` + `SightLoomProvider` |
+
+```bash
+cargo test -p reelforge-intelligence-sightloom
+```
+
 ## Status
 
-Core contracts + namespaced IDs + privacy policy + provider interface + resolve/compile. Next: load real VisionIndex packages into `AnalysisSnapshot`.
+Package load path works: real `VisionIndexPackage` → freeze most-frequent subject with namespaced IDs.
 
 ## License
 

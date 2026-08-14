@@ -1,5 +1,8 @@
 [workspace]
-members = ["crates/reelforge-intelligence-core"]
+members = [
+    "crates/reelforge-intelligence-core",
+    "crates/reelforge-intelligence-sightloom",
+]
 resolver = "3"
 
 [workspace.package]
