@@ -27,7 +27,8 @@ Owns the missing layer:
 1. `SemanticEditPlan` — human/agent intent  
 2. `AnalysisSnapshot` — host projection of VisionIndex  
 3. `ResolvedEditPlan` — freeze for reproducibility  
-4. `compile_resolved` — final RenderGraph IR stub for ReelForge  
+4. `compile_resolved` — typed `RenderGraphIr` + JSON for ReelForge  
+5. `approve` / `approve_and_render` — privacy Review gate
 
 ## Do not put in Intelligence
 
@@ -44,8 +45,10 @@ Owns the missing layer:
 
 ## Next milestones
 
-1. ~~Fill `AnalysisSnapshot` from real SightLoom package~~ **done** (`reelforge-intelligence-sightloom`)  
-2. Stronger RenderGraph schema shared with ReelForge  
-3. MCP host binary + approve workflow  
+1. ~~Fill `AnalysisSnapshot` from real SightLoom package~~ **done**  
+2. ~~Stronger RenderGraph schema~~ **done** (`RenderGraphIr` + op ids)  
+3. ~~Approve workflow~~ **done** (`ApprovalRecord`, `approve_and_render`)  
+4. Map `RenderGraphIr` → live `reelforge::RenderGraph` / run plan  
+5. MCP host binary packaging
 
 

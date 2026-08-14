@@ -1,7 +1,7 @@
 //! P4 Intelligence contract. MCP must only dispatch these methods.
 
 use crate::catalog::{HostCatalog, MediaInspection, SceneHit, SubjectHit};
-use crate::compile::{CompileReport, compile_resolved};
+use crate::compile::{CompileReport, approve_compile, compile_resolved};
 use crate::edit::SemanticEditPlan;
 use crate::error::{IntelError, Result};
 use crate::mask::{MaskArtifact, MaskRequest};
@@ -239,13 +239,22 @@ impl IntelligenceService {
 
     /// Final render request bound to a frozen resolution.
     ///
+    /// Fails when privacy policy requires approval and it is not granted —
+    /// call [`Self::approve_and_render`] after operator sign-off.
+    ///
     /// # Errors
     ///
-    /// Compile failure.
+    /// Compile failure or approval gate.
     pub fn render_resolved(&self, resolved: &ResolvedEditPlan) -> Result<HostRequest> {
         let report = self.compile_resolved(resolved)?;
         if !report.ok || !report.final_graph {
             return Err(IntelError::message("render_resolved: compile failed"));
+        }
+        if !report.allows_execute() {
+            return Err(IntelError::message(format!(
+                "render_resolved: approval required ({})",
+                report.approval.reasons.join(", ")
+            )));
         }
         Ok(HostRequest::Render {
             media: resolved.media.clone(),
@@ -255,6 +264,38 @@ impl IntelligenceService {
                 .and_then(|i| i.target_output.clone()),
             resolved_plan: Some(Box::new(resolved.clone())),
         })
+    }
+
+    /// Approve a final compile report (operator gate).
+    #[must_use]
+    pub fn approve_report(&self, report: CompileReport, by: impl Into<String>) -> CompileReport {
+        approve_compile(report, by)
+    }
+
+    /// Compile + approve + host render request in one call.
+    ///
+    /// # Errors
+    ///
+    /// Compile failure.
+    pub fn approve_and_render(
+        &self,
+        resolved: &ResolvedEditPlan,
+        by: impl Into<String>,
+    ) -> Result<(CompileReport, HostRequest)> {
+        let report = self.compile_resolved(resolved)?;
+        let report = approve_compile(report, by);
+        if !report.allows_execute() {
+            return Err(IntelError::message("approve_and_render: still blocked"));
+        }
+        let req = HostRequest::Render {
+            media: resolved.media.clone(),
+            output: resolved
+                .intent
+                .as_ref()
+                .and_then(|i| i.target_output.clone()),
+            resolved_plan: Some(Box::new(resolved.clone())),
+        };
+        Ok((report, req))
     }
 
     /// Full pipeline: resolve → final compile.

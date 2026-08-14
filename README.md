@@ -86,9 +86,19 @@ It does **not** store VisionIndex or decode video.
 cargo test -p reelforge-intelligence-sightloom
 ```
 
+## Typed RenderGraph + approve
+
+`compile_resolved` produces [`RenderGraphIr`](crates/reelforge-intelligence-core/src/render_graph.rs):
+
+- nodes: `source` → `rf.adapter.sightloom` → semantic ops (`rf.redaction.region`, `rf.transform.concat`, …) → `output`
+- pins: `vision_index_generation` / `vision_index_hash` / `source_hash`
+- **approval gate** when privacy is `review` (`approve_and_render`)
+
+Preview intent compile stays `final_graph: false`.
+
 ## Status
 
-Package load path works: real `VisionIndexPackage` → freeze most-frequent subject with namespaced IDs.
+Package load → freeze → typed graph → approve gate. Next: map `RenderGraphIr` into live `reelforge::RenderGraph` / ExecutionPlan.
 
 ## License
 

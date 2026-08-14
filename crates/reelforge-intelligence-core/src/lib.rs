@@ -16,8 +16,8 @@
 //!   → SemanticEditPlan          (intent)
 //!   → AnalysisProvider          (SightLoomProvider first)
 //!   → ResolvedEditPlan          (frozen, namespaced IDs)
-//!   → compile_resolved          (final RenderGraph JSON stub)
-//!   → host preview / approve
+//!   → compile_resolved          (typed RenderGraphIr + JSON)
+//!   → approve (if privacy Review)
 //!   → ReelForge execute
 //! ```
 //!
@@ -44,6 +44,7 @@ mod ops;
 mod policy;
 mod provider;
 mod query;
+mod render_graph;
 mod resolve;
 mod resolved;
 mod selector;
@@ -53,7 +54,9 @@ mod time;
 
 pub use catalog::{HostCatalog, MediaInspection, SceneHit, SubjectHit};
 pub use compile::AnalysisProvider as AnalysisProviderDescriptor;
-pub use compile::{CompileReport, CompileWarning, compile_resolved};
+pub use compile::{
+    CompileReport, CompileWarning, approval_status, approve_compile, compile_resolved,
+};
 pub use edit::{
     AnomalyQuery, FramingPolicy, FrequencyMetric, SEMANTIC_EDIT_PLAN_VERSION, SemanticEdit,
     SemanticEditPlan,
@@ -72,6 +75,10 @@ pub use provider::{
     SubjectResult,
 };
 pub use query::EventQuery;
+pub use render_graph::{
+    ApprovalRecord, GraphAsset, GraphNode, GraphNodeKind, INTEL_RENDER_GRAPH_VERSION,
+    RenderGraphIr, approval_for_resolved, approve, graph_from_resolved, op_id,
+};
 pub use resolve::{AnalysisSnapshot, AnomalyEvidence, SubjectEvidence, resolve_plan};
 pub use resolved::{
     RESOLVED_EDIT_PLAN_VERSION, ResolutionDecision, ResolutionWarning, ResolvedEditPlan,

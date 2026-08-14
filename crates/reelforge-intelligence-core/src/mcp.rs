@@ -75,6 +75,12 @@ pub fn dispatch(svc: &IntelligenceService, method: &str, args: &Value) -> Result
             let resolved = resolved_arg(args)?;
             Ok(serde_json::to_value(svc.render_resolved(&resolved)?).unwrap_or(Value::Null))
         }
+        "approve_and_render" => {
+            let resolved = resolved_arg(args)?;
+            let by = args.get("by").and_then(Value::as_str).unwrap_or("operator");
+            let (report, req) = svc.approve_and_render(&resolved, by)?;
+            Ok(serde_json::json!({ "report": report, "request": req }))
+        }
         other => Err(IntelError::message(format!(
             "unknown intelligence method `{other}`"
         ))),
