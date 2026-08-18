@@ -62,6 +62,9 @@ pub struct CompileReport {
     /// Bridge warnings when reelforge graph was produced.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bridge_warnings: Vec<String>,
+    /// ReelForge MaskPackage id pinned on the freeze.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_package_id: Option<String>,
 }
 
 impl CompileReport {
@@ -101,12 +104,18 @@ impl CompileReport {
 /// Invalid resolved plan.
 pub fn compile_resolved(resolved: &ResolvedEditPlan) -> crate::Result<CompileReport> {
     resolved.validate()?;
+    if reel_or_event_intent(resolved) && resolved.resolved_ranges.is_empty() {
+        return Err(IntelError::message(
+            "compile: reel/event intent has no resolved ranges",
+        ));
+    }
     let graph = graph_from_resolved(resolved);
     let mut report = CompileReport::success();
     report.final_graph = true;
     report.providers_used.push("intelligence-resolved".into());
     report.vision_index_generation = Some(resolved.vision_index_generation.clone());
     report.vision_index_hash = Some(resolved.vision_index_hash.clone());
+    report.mask_package_id.clone_from(&resolved.mask_package_id);
     report.approval = graph.approval.clone();
     report.render_graph_json = Some(
         graph
@@ -130,6 +139,20 @@ pub fn compile_resolved(resolved: &ResolvedEditPlan) -> crate::Result<CompileRep
         });
     }
     Ok(report)
+}
+
+fn reel_or_event_intent(resolved: &ResolvedEditPlan) -> bool {
+    resolved.intent.as_ref().is_some_and(|intent| {
+        intent.edits.iter().any(|e| {
+            matches!(
+                e,
+                crate::edit::SemanticEdit::BuildSubjectReel { .. }
+                    | crate::edit::SemanticEdit::BuildMostFrequentSubjectReel { .. }
+                    | crate::edit::SemanticEdit::BuildAnomalyReel { .. }
+                    | crate::edit::SemanticEdit::CreateEventClips { .. }
+            )
+        })
+    })
 }
 
 /// Attach operator approval onto a final compile report (and embedded graph).

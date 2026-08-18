@@ -23,8 +23,10 @@ pub mod op_id {
     pub const TRANSFORM_TRIM: &str = "rf.transform.trim";
     /// Crop / follow framing.
     pub const TRANSFORM_CROP: &str = "rf.transform.crop";
-    /// Concatenate reels.
-    pub const TRANSFORM_CONCAT: &str = "rf.transform.concat";
+    /// Deprecated alias for [`TIMELINE_CONCAT`].
+    pub const TRANSFORM_CONCAT: &str = "rf.timeline.concat";
+    /// Sequential clip concatenation (not layer composition).
+    pub const TIMELINE_CONCAT: &str = "rf.timeline.concat";
     /// Adapter stage (SightLoom materialization).
     pub const ADAPTER_SIGHTLOOM: &str = "rf.adapter.sightloom";
 }
@@ -140,6 +142,30 @@ pub struct ApprovalRecord {
     /// Reason codes that triggered the gate.
     #[serde(default)]
     pub reasons: Vec<String>,
+    /// Bound graph fingerprint (SHA-256 of canonical live graph JSON).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_fingerprint: Option<String>,
+    /// Bound IR fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ir_fingerprint: Option<String>,
+    /// Bound resolved-plan fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_fingerprint: Option<String>,
+    /// Bound policy hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_hash: Option<String>,
+    /// Bound output URI hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_uri_hash: Option<String>,
+    /// Approval unix timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at_unix: Option<i64>,
+    /// Optional expiration unix timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<i64>,
+    /// HMAC-SHA256 hex of the bound fingerprints when `RF_INTEL_APPROVAL_HMAC` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 impl ApprovalRecord {
@@ -192,15 +218,56 @@ pub fn approval_for_resolved(
         approved: false,
         approved_by: None,
         reasons,
+        graph_fingerprint: None,
+        ir_fingerprint: None,
+        resolved_fingerprint: None,
+        policy_hash: None,
+        output_uri_hash: None,
+        approved_at_unix: None,
+        expires_at_unix: None,
+        signature: None,
     }
 }
 
-/// Mark a record approved by operator.
+/// Mark a record approved by operator (does not bind fingerprints).
 #[must_use]
 pub fn approve(mut record: ApprovalRecord, by: impl Into<String>) -> ApprovalRecord {
     record.approved = true;
     record.approved_by = Some(by.into());
+    record.approved_at_unix = Some(now_unix());
     record
+}
+
+/// Bind fingerprints onto an approved record.
+#[must_use]
+pub fn bind_approval(
+    mut record: ApprovalRecord,
+    graph_fingerprint: impl Into<String>,
+    ir_fingerprint: impl Into<String>,
+    resolved_fingerprint: impl Into<String>,
+    policy_hash: impl Into<String>,
+    output_uri_hash: impl Into<String>,
+) -> ApprovalRecord {
+    record.graph_fingerprint = Some(graph_fingerprint.into());
+    record.ir_fingerprint = Some(ir_fingerprint.into());
+    record.resolved_fingerprint = Some(resolved_fingerprint.into());
+    record.policy_hash = Some(policy_hash.into());
+    record.output_uri_hash = Some(output_uri_hash.into());
+    let material = crate::digest::approval_material(
+        record.graph_fingerprint.as_deref().unwrap_or(""),
+        record.ir_fingerprint.as_deref().unwrap_or(""),
+        record.resolved_fingerprint.as_deref().unwrap_or(""),
+        record.policy_hash.as_deref().unwrap_or(""),
+        record.output_uri_hash.as_deref().unwrap_or(""),
+    );
+    record.signature = crate::digest::maybe_sign_approval(&material);
+    record
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
 }
 
 /// Build typed graph from frozen resolution (final).
@@ -247,6 +314,7 @@ pub fn graph_from_resolved(resolved: &ResolvedEditPlan) -> RenderGraphIr {
                 "subjects": subjects,
                 "vision_index_generation": resolved.vision_index_generation,
                 "vision_index_hash": resolved.vision_index_hash,
+                "package_id": resolved.mask_package_id,
                 "ranges": ranges_json(&resolved.resolved_ranges),
             })),
             semantic: Some("materialize".into()),
@@ -288,25 +356,54 @@ pub fn graph_from_resolved(resolved: &ResolvedEditPlan) -> RenderGraphIr {
         }
     }
 
-    // Anomaly / event trims as concat chain
-    for (i, ev) in resolved.resolved_events.iter().enumerate() {
-        let id = format!("ev{i}");
-        nodes.push(GraphNode {
-            id: id.clone(),
-            kind: GraphNodeKind::Op,
-            operation: Some(op_id::TRANSFORM_TRIM.into()),
-            inputs: vec![prev.clone()],
-            asset: None,
-            name: None,
-            params: Some(serde_json::json!({
-                "event_id": ev.event_id,
-                "kind": ev.kind,
-                "subject": ev.subject.as_ref().map(NamespacedId::as_uri),
-                "range": range_json(&ev.range),
-            })),
-            semantic: Some("build_anomaly_reel".into()),
-        });
-        prev = id;
+    // Event / anomaly ranges: independent trims off the same parent, then concat.
+    // Skip when intent already mapped those edits (avoids double concat).
+    let events_already_mapped = intent_ops.iter().any(|e| {
+        matches!(
+            e,
+            SemanticEdit::BuildAnomalyReel { .. } | SemanticEdit::CreateEventClips { .. }
+        )
+    });
+    if !events_already_mapped && !resolved.resolved_events.is_empty() {
+        let mut trim_ids = Vec::new();
+        for (i, ev) in resolved.resolved_events.iter().enumerate() {
+            let id = format!("ev{i}");
+            nodes.push(GraphNode {
+                id: id.clone(),
+                kind: GraphNodeKind::Op,
+                operation: Some(op_id::TRANSFORM_TRIM.into()),
+                inputs: vec![prev.clone()],
+                asset: None,
+                name: None,
+                params: Some(serde_json::json!({
+                    "event_id": ev.event_id,
+                    "kind": ev.kind,
+                    "subject": ev.subject.as_ref().map(NamespacedId::as_uri),
+                    "range": range_json(&ev.range),
+                })),
+                semantic: Some("event_trim".into()),
+            });
+            trim_ids.push(id);
+        }
+        if trim_ids.len() == 1 {
+            prev = trim_ids.remove(0);
+        } else {
+            let id = "events_concat".to_string();
+            nodes.push(GraphNode {
+                id: id.clone(),
+                kind: GraphNodeKind::Op,
+                operation: Some(op_id::TIMELINE_CONCAT.into()),
+                inputs: trim_ids,
+                asset: None,
+                name: None,
+                params: Some(serde_json::json!({
+                    "ranges": ranges_json(&resolved.resolved_events.iter().map(|e| e.range).collect::<Vec<_>>()),
+                    "mode": "event_reel",
+                })),
+                semantic: Some("event_concat".into()),
+            });
+            prev = id;
+        }
     }
 
     nodes.push(GraphNode {
@@ -347,20 +444,31 @@ fn map_edit_to_op(
     resolved: &ResolvedEditPlan,
 ) -> (&'static str, serde_json::Value) {
     match edit {
-        SemanticEdit::BlurSubject { .. } | SemanticEdit::BlurEveryoneExcept { .. } => {
+        SemanticEdit::BlurSubject { .. }
+        | SemanticEdit::BlurEveryoneExcept { .. }
+        | SemanticEdit::RedactPii { .. } => {
             (op_id::REDACTION_REGION, redaction_params(resolved))
         }
-        SemanticEdit::FollowSubject { framing, .. } => (
-            op_id::TRANSFORM_CROP,
-            serde_json::json!({
+        SemanticEdit::FollowSubject { framing, .. } => {
+            let mut params = serde_json::json!({
                 "framing": framing,
                 "subjects": resolved.resolved_subjects.iter().map(|s| s.id.as_uri()).collect::<Vec<_>>(),
                 "ranges": ranges_json(&resolved.resolved_ranges),
-            }),
-        ),
+            });
+            if let Some(crop) = follow_crop_params(resolved, *framing) {
+                if let Some(obj) = params.as_object_mut() {
+                    if let Some(c) = crop.as_object() {
+                        for (k, v) in c {
+                            obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            (op_id::TRANSFORM_CROP, params)
+        }
         SemanticEdit::BuildSubjectReel { .. }
         | SemanticEdit::BuildMostFrequentSubjectReel { .. } => (
-            op_id::TRANSFORM_CONCAT,
+            op_id::TIMELINE_CONCAT,
             serde_json::json!({
                 "subjects": resolved.resolved_subjects.iter().map(|s| s.id.as_uri()).collect::<Vec<_>>(),
                 "ranges": ranges_json(&resolved.resolved_ranges),
@@ -368,10 +476,11 @@ fn map_edit_to_op(
             }),
         ),
         SemanticEdit::BuildAnomalyReel { .. } | SemanticEdit::CreateEventClips { .. } => (
-            op_id::TRANSFORM_TRIM,
+            op_id::TIMELINE_CONCAT,
             serde_json::json!({
                 "events": resolved.resolved_events.len(),
                 "ranges": ranges_json(&resolved.resolved_ranges),
+                "mode": "event_reel",
             }),
         ),
     }
@@ -385,6 +494,49 @@ fn redaction_params(resolved: &ResolvedEditPlan) -> serde_json::Value {
         "masks": resolved.resolved_masks.len(),
         "privacy": resolved.policy.privacy,
     })
+}
+
+fn follow_crop_params(
+    resolved: &ResolvedEditPlan,
+    framing: crate::edit::FramingPolicy,
+) -> Option<serde_json::Value> {
+    let w = resolved.frame_width?;
+    let h = resolved.frame_height?;
+    let frame = crate::framing::FrameSize::new(w, h)?;
+    let mut boxes: Vec<crate::mask::RegionSample> = resolved
+        .resolved_masks
+        .iter()
+        .filter_map(|m| m.artifact.as_ref())
+        .flat_map(|a| a.regions.clone())
+        .collect();
+    if boxes.is_empty() {
+        let ts = resolved
+            .resolved_ranges
+            .first()
+            .map_or(1_000_000_000, |r| r.start.timescale);
+        boxes = resolved
+            .subject_boxes
+            .iter()
+            .map(|(_, xyxy)| crate::mask::RegionSample {
+                at: crate::time::MediaTime::new(0, ts.max(1)),
+                box_xyxy: *xyxy,
+                subject: None,
+                confidence: None,
+                geometry: None,
+            })
+            .collect();
+    }
+    if boxes.is_empty() {
+        return None;
+    }
+    crate::framing::compute_follow_crop(
+        &boxes,
+        framing,
+        frame,
+        crate::framing::FramingOptions::default(),
+    )
+    .ok()
+    .map(crate::framing::CropRect::to_params)
 }
 
 fn ranges_json(ranges: &[MediaRange]) -> Vec<serde_json::Value> {
@@ -412,16 +564,21 @@ mod tests {
             vision_index_generation: "gen-1".into(),
             vision_index_hash: "idx".into(),
             timescale: 1_000_000_000,
-            subjects: vec![SubjectEvidence {
-                subject_id: 7,
-                label: Some("x".into()),
-                appearance_count: 9,
-                source_ids: vec![1],
-                first_ticks: 0,
-                last_ticks: 5,
-                confidence: Some(0.2),
-            }],
+            subjects: vec![
+                SubjectEvidence {
+                    subject_id: 7,
+                    label: Some("x".into()),
+                    appearance_count: 9,
+                    source_ids: vec![1],
+                    first_ticks: 0,
+                    last_ticks: 5,
+                    confidence: Some(0.2),
+                    ..SubjectEvidence::default()
+                }
+                .with_visit(0, 5),
+            ],
             anomalies: Vec::new(),
+            ..AnalysisSnapshot::default()
         }
     }
 
@@ -465,5 +622,29 @@ mod tests {
         assert!(!graph.approval.allows_execute());
         let approved = approve(graph.approval.clone(), "operator-1");
         assert!(approved.allows_execute());
+    }
+
+    #[test]
+    fn follow_crop_emits_pixel_geometry_from_snapshot_frame() {
+        let mut analysis = snap();
+        analysis.frame_width = Some(1920);
+        analysis.frame_height = Some(1080);
+        analysis.subject_boxes = vec![(7, [100.0, 100.0, 200.0, 200.0])];
+        let intent = SemanticEditPlan::new("cam1").with_edit(SemanticEdit::FollowSubject {
+            subject: crate::selector::SubjectSelector::SubjectIds { ids: vec![7] },
+            framing: crate::edit::FramingPolicy::Tight,
+        });
+        let resolved = resolve_plan(&intent, &analysis, IntelligencePolicy::default()).unwrap();
+        let graph = graph_from_resolved(&resolved);
+        let crop = graph
+            .nodes
+            .iter()
+            .find(|n| n.operation.as_deref() == Some(op_id::TRANSFORM_CROP))
+            .and_then(|n| n.params.as_ref())
+            .expect("crop node");
+        assert!(crop.get("w").and_then(serde_json::Value::as_u64).unwrap() >= 100);
+        assert!(crop.get("h").and_then(serde_json::Value::as_u64).unwrap() >= 100);
+        assert!(crop.get("x").is_some());
+        assert!(crop.get("y").is_some());
     }
 }

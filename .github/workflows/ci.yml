@@ -13,13 +13,30 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: intelligence
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: intelligence
+      - name: checkout ReelForge sibling
+        uses: actions/checkout@v4
+        with:
+          repository: sergii-ziborov/ReelForge
+          path: ReelForge
+      - name: checkout SightLoom sibling
+        uses: actions/checkout@v4
+        with:
+          repository: sergii-ziborov/SightLoom
+          path: SightLoom
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: intelligence
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy

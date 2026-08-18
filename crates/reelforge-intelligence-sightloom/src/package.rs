@@ -51,7 +51,10 @@ pub fn load_package(dir: impl AsRef<Path>) -> Result<LoadedVisionPackage, SightL
         // Freeze still needs a pin; fall back to media name digest.
         source_hash = format!("media:{}", fnv1a64(index.header.name.as_bytes()));
     }
-    let snapshot = snapshot_from_index(&index, &generation, &content_hash, &source_hash);
+    let mut snapshot = snapshot_from_index(&index, &generation, &content_hash, &source_hash);
+    if let Some(meta) = mask_package_sidecar(root, &payload) {
+        apply_mask_package_meta(&mut snapshot, &meta);
+    }
     let subject_boxes = subject_boxes_from_index(&index);
     Ok(LoadedVisionPackage {
         index,
@@ -91,6 +94,115 @@ pub fn provider_from_package(
     Ok(load_package(dir)?.provider())
 }
 
+/// Export a ReelForge MaskPackage and pin its id onto the loaded snapshot.
+///
+/// Also writes `{vision_index}/mask-package.json` so the next `load_package` finds it.
+///
+/// # Errors
+///
+/// I/O while writing the package.
+pub fn export_and_pin_mask_package(
+    loaded: &mut LoadedVisionPackage,
+    dest: impl AsRef<Path>,
+) -> Result<crate::MaskPackageExport, SightLoomAdapterError> {
+    let package_id = loaded
+        .snapshot
+        .mask_package_id
+        .clone()
+        .unwrap_or_else(|| loaded.generation.clone());
+    let exported = crate::write_mask_package(
+        &loaded.index,
+        dest.as_ref(),
+        &package_id,
+        Some(loaded.source_hash.as_str()),
+        loaded.snapshot.frame_width,
+        loaded.snapshot.frame_height,
+    )?;
+    let frame_width = loaded.snapshot.frame_width;
+    let frame_height = loaded.snapshot.frame_height;
+    apply_mask_package_meta(
+        &mut loaded.snapshot,
+        &MaskPackageMeta {
+            package_id: exported.package_id.clone(),
+            source_width: frame_width,
+            source_height: frame_height,
+        },
+    );
+    loaded.snapshot.mask_package_uri = Some(exported.root.to_string_lossy().into_owned());
+    let pointer = serde_json::json!({
+        "package_id": exported.package_id,
+        "source_width": loaded.snapshot.frame_width,
+        "source_height": loaded.snapshot.frame_height
+    });
+    let _ = fs::write(
+        loaded.package_root.join("mask-package.json"),
+        pointer.to_string(),
+    );
+    Ok(exported)
+}
+
+struct MaskPackageMeta {
+    package_id: String,
+    source_width: Option<u32>,
+    source_height: Option<u32>,
+}
+
+fn mask_package_sidecar(root: &Path, payload: &Path) -> Option<MaskPackageMeta> {
+    // Do not read SightLoom's own `manifest.json` — look for an explicit
+    // ReelForge MaskPackage pointer or subdirectory.
+    let candidates = [
+        payload.join("mask-package.json"),
+        root.join("mask-package.json"),
+        payload.join("mask_package").join("manifest.json"),
+        root.join("mask_package").join("manifest.json"),
+    ];
+    for path in candidates {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(package_id) = value
+            .get("package_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        return Some(MaskPackageMeta {
+            package_id: package_id.to_string(),
+            source_width: value
+                .get("source_width")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|w| u32::try_from(w).ok()),
+            source_height: value
+                .get("source_height")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|h| u32::try_from(h).ok()),
+        });
+    }
+    None
+}
+
+fn apply_mask_package_meta(snapshot: &mut AnalysisSnapshot, meta: &MaskPackageMeta) {
+    snapshot.mask_package_id = Some(meta.package_id.clone());
+    if let Some(w) = meta.source_width {
+        snapshot.frame_width = Some(w);
+    }
+    if let Some(h) = meta.source_height {
+        snapshot.frame_height = Some(h);
+    }
+    for sample in &mut snapshot.mask_samples {
+        if let Some(reelforge_intelligence_core::MaskGeometry::External { package_id, .. }) =
+            &mut sample.geometry
+        {
+            package_id.clone_from(&meta.package_id);
+        }
+    }
+}
+
 fn source_hash_from_index(index: &VisionIndex) -> String {
     // Prefer first source entry hash if present.
     for s in &index.header.sources {
@@ -111,26 +223,31 @@ fn content_hash_for_payload(
 ) -> Result<String, SightLoomAdapterError> {
     let checksums = payload.join("checksums.json");
     if checksums.is_file() {
-        let text = fs::read_to_string(&checksums)
-            .map_err(|e| SightLoomAdapterError::Package(e.to_string()))?;
-        // Prefer fnv aggregate or whole-file hash of checksums document.
-        return Ok(format!("checksums:{}", fnv1a64(text.as_bytes())));
+        let bytes =
+            fs::read(&checksums).map_err(|e| SightLoomAdapterError::Package(e.to_string()))?;
+        return Ok(format!(
+            "checksums:{}",
+            reelforge_intelligence_core::sha256_hex(&bytes)
+        ));
     }
-    // Fallback: stable digest of generation name + entity file sizes.
     let mut acc = generation.as_bytes().to_vec();
     for name in [
         "entities.json",
         "tracks.cbor",
         "manifest.json",
         "gallery.json",
+        "masks.bin",
     ] {
         let p = payload.join(name);
-        if let Ok(meta) = fs::metadata(&p) {
+        if let Ok(bytes) = fs::read(&p) {
             acc.extend_from_slice(name.as_bytes());
-            acc.extend_from_slice(&meta.len().to_le_bytes());
+            acc.extend_from_slice(&bytes);
         }
     }
-    Ok(format!("digest:{:016x}", fnv1a64(&acc)))
+    Ok(format!(
+        "sha256:{}",
+        reelforge_intelligence_core::sha256_hex(&acc)
+    ))
 }
 
 fn fnv1a64(data: &[u8]) -> u64 {

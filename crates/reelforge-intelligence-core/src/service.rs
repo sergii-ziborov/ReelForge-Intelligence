@@ -43,6 +43,12 @@ pub enum HostRequest {
         /// Live ReelForge `RenderGraph` JSON (after bridge).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reelforge_graph_json: Option<String>,
+        /// ReelForge MaskPackage id (`SightloomPackageHost` match key).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask_package_id: Option<String>,
+        /// Directory URI/path the host should open as a MaskPackage.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask_package_uri: Option<String>,
     },
 }
 
@@ -146,6 +152,21 @@ impl IntelligenceService {
         plan
     }
 
+    /// Rewrite host-resolved [`crate::SubjectSelector::FramePick`] entries to `SubjectIds`.
+    ///
+    /// Does not open photos or query SightLoom — bindings come from the host.
+    ///
+    /// # Errors
+    ///
+    /// Unbound `FramePick` or empty id list.
+    pub fn rewrite_selectors(
+        &self,
+        plan: SemanticEditPlan,
+        bindings: &[crate::SelectorBinding],
+    ) -> Result<SemanticEditPlan> {
+        crate::rewrite_selectors(plan, bindings)
+    }
+
     /// Conservative repairs.
     #[must_use]
     pub fn repair_plan(&self, mut plan: SemanticEditPlan) -> SemanticEditPlan {
@@ -239,12 +260,12 @@ impl IntelligenceService {
         if !report.ok {
             return Err(IntelError::message("render: compile_plan failed"));
         }
-        Ok(HostRequest::Render {
-            media: plan.media.clone(),
-            output: plan.target_output.clone(),
-            resolved_plan: None,
-            reelforge_graph_json: None,
-        })
+        Ok(host_render(
+            plan.media.clone(),
+            plan.target_output.clone(),
+            None,
+            None,
+        ))
     }
 
     /// Final render request bound to a frozen resolution.
@@ -270,15 +291,13 @@ impl IntelligenceService {
             .intent
             .as_ref()
             .and_then(|i| i.target_output.clone());
-        let reelforge_graph_json = bridge_resolved_for_execute(resolved, output.clone())
-            .ok()
-            .map(|b| b.graph_json);
-        Ok(HostRequest::Render {
-            media: resolved.media.clone(),
+        let bridged = bridge_resolved_for_execute(resolved, output.clone())?;
+        Ok(host_render(
+            resolved.media.clone(),
             output,
-            resolved_plan: Some(Box::new(resolved.clone())),
-            reelforge_graph_json,
-        })
+            Some(Box::new(resolved.clone())),
+            Some(bridged.graph_json),
+        ))
     }
 
     /// Approve a final compile report (operator gate).
@@ -308,29 +327,52 @@ impl IntelligenceService {
             .intent
             .as_ref()
             .and_then(|i| i.target_output.clone());
-        match bridge_resolved_for_execute(resolved, output.clone()) {
-            Ok(bridged) => {
-                report.reelforge_graph_json = Some(bridged.graph_json.clone());
-                report.bridge_warnings = bridged.warnings;
-                let req = HostRequest::Render {
-                    media: resolved.media.clone(),
-                    output,
-                    resolved_plan: Some(Box::new(resolved.clone())),
-                    reelforge_graph_json: Some(bridged.graph_json),
-                };
-                Ok((report, req))
-            }
-            Err(e) => {
-                report.bridge_warnings.push(format!("bridge: {e}"));
-                let req = HostRequest::Render {
-                    media: resolved.media.clone(),
-                    output,
-                    resolved_plan: Some(Box::new(resolved.clone())),
-                    reelforge_graph_json: report.reelforge_graph_json.clone(),
-                };
-                Ok((report, req))
-            }
+        let bridged = bridge_resolved_for_execute(resolved, output.clone())?;
+        report.reelforge_graph_json = Some(bridged.graph_json.clone());
+        report.bridge_warnings = bridged.warnings;
+        let graph_fp = crate::digest::fingerprint_graph_json(&bridged.graph_json)?;
+        let ir_fp = report
+            .render_graph
+            .as_ref()
+            .map(crate::digest::fingerprint_ir)
+            .transpose()?
+            .unwrap_or_default();
+        let resolved_fp = crate::digest::fingerprint_resolved(resolved)?;
+        let policy_fp = crate::digest::fingerprint_value(
+            &serde_json::to_value(&resolved.policy).unwrap_or(serde_json::Value::Null),
+        )?;
+        let out_fp = crate::digest::sha256_hex(output.as_deref().unwrap_or("").as_bytes());
+        report.approval = crate::render_graph::bind_approval(
+            report.approval,
+            graph_fp,
+            ir_fp,
+            resolved_fp,
+            policy_fp,
+            out_fp,
+        );
+        let material = crate::digest::approval_material(
+            report.approval.graph_fingerprint.as_deref().unwrap_or(""),
+            report.approval.ir_fingerprint.as_deref().unwrap_or(""),
+            report
+                .approval
+                .resolved_fingerprint
+                .as_deref()
+                .unwrap_or(""),
+            report.approval.policy_hash.as_deref().unwrap_or(""),
+            report.approval.output_uri_hash.as_deref().unwrap_or(""),
+        );
+        crate::digest::verify_approval_signature(report.approval.signature.as_deref(), &material)?;
+        if let Some(ref mut g) = report.render_graph {
+            g.approval = report.approval.clone();
         }
+        report.mask_package_id.clone_from(&resolved.mask_package_id);
+        let req = host_render(
+            resolved.media.clone(),
+            output,
+            Some(Box::new(resolved.clone())),
+            Some(bridged.graph_json),
+        );
+        Ok((report, req))
     }
 
     /// Bridge a typed IR into a live ReelForge graph (+ optional schedule).
@@ -430,6 +472,25 @@ impl IntelligenceService {
             artifact: Some(artifact),
         });
         resolved
+    }
+}
+
+fn host_render(
+    media: String,
+    output: Option<String>,
+    resolved_plan: Option<Box<ResolvedEditPlan>>,
+    reelforge_graph_json: Option<String>,
+) -> HostRequest {
+    let (mask_package_id, mask_package_uri) = resolved_plan.as_ref().map_or((None, None), |p| {
+        (p.mask_package_id.clone(), p.mask_package_uri.clone())
+    });
+    HostRequest::Render {
+        media,
+        output,
+        resolved_plan,
+        reelforge_graph_json,
+        mask_package_id,
+        mask_package_uri,
     }
 }
 

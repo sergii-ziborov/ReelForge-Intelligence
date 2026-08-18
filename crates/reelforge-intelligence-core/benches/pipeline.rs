@@ -12,11 +12,11 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use reelforge_intelligence_core::{
     AnalysisSnapshot, BridgeOptions, FrequencyMetric, IntelligencePolicy, MaskArtifact,
-    MaskFidelity, RegionSample, SemanticEdit, SemanticEditPlan, SubjectEvidence,
-    bridge_resolved, bridge_to_reelforge, compile_resolved, graph_from_resolved,
-    mask_timeline_from_regions, resolve_plan,
+    MaskFidelity, RegionSample, SemanticEdit, SemanticEditPlan, SubjectEvidence, bridge_resolved,
+    bridge_to_reelforge, compile_resolved, graph_from_resolved, mask_timeline_from_regions,
+    resolve_plan,
 };
-use reelforge_intelligence_core::{ResolvedMaskAsset, MediaRange, MediaTime};
+use reelforge_intelligence_core::{MediaRange, MediaTime, ResolvedMaskAsset};
 use std::time::Duration;
 
 fn subject(id: u64, appearances: u64) -> SubjectEvidence {
@@ -28,7 +28,9 @@ fn subject(id: u64, appearances: u64) -> SubjectEvidence {
         first_ticks: 0,
         last_ticks: 10_000_000_000,
         confidence: Some(0.9),
+        ..SubjectEvidence::default()
     }
+    .with_visit(0, 10_000_000_000)
 }
 
 fn snapshot(n_subjects: usize) -> AnalysisSnapshot {
@@ -52,6 +54,7 @@ fn snapshot(n_subjects: usize) -> AnalysisSnapshot {
         timescale: 1_000_000_000,
         subjects,
         anomalies: Vec::new(),
+        ..AnalysisSnapshot::default()
     }
 }
 
@@ -69,7 +72,10 @@ fn intent_blur() -> SemanticEditPlan {
     })
 }
 
-fn resolved_with_masks(n_subjects: usize, n_regions: usize) -> reelforge_intelligence_core::ResolvedEditPlan {
+fn resolved_with_masks(
+    n_subjects: usize,
+    n_regions: usize,
+) -> reelforge_intelligence_core::ResolvedEditPlan {
     let snap = snapshot(n_subjects);
     let intent = intent_blur();
     let mut resolved = resolve_plan(&intent, &snap, IntelligencePolicy::default()).unwrap();
@@ -78,14 +84,10 @@ fn resolved_with_masks(n_subjects: usize, n_regions: usize) -> reelforge_intelli
             let t = i as i64 * 33_333_333; // ~30 fps
             RegionSample {
                 at: MediaTime::new(t, 1_000_000_000),
-                box_xyxy: [
-                    100.0 + i as f32,
-                    80.0,
-                    220.0 + i as f32,
-                    300.0,
-                ],
+                box_xyxy: [100.0 + i as f32, 80.0, 220.0 + i as f32, 300.0],
                 subject: resolved.resolved_subjects.first().map(|s| s.id.clone()),
                 confidence: Some(0.95),
+                geometry: None,
             }
         })
         .collect();
@@ -201,33 +203,30 @@ fn bench_pipeline(c: &mut Criterion) {
     };
     for n in [10usize, 100, 1_000] {
         let snap = snapshot(n);
-        g.bench_with_input(
-            BenchmarkId::new("resolve_compile_bridge", n),
-            &n,
-            |b, _| {
-                b.iter(|| {
-                    let mut resolved =
-                        resolve_plan(black_box(&intent), black_box(&snap), policy.clone()).unwrap();
-                    // Attach a few regions like a host would after materialize_masks.
-                    resolved.resolved_masks.push(ResolvedMaskAsset {
-                        mask_id: None,
-                        mask_ref: None,
-                        subject: resolved.resolved_subjects.first().map(|s| s.id.clone()),
-                        range: None,
-                        fidelity: MaskFidelity::BBoxProxy,
-                        artifact: Some(MaskArtifact::from_regions(vec![RegionSample {
-                            at: MediaTime::new(0, 1_000_000_000),
-                            box_xyxy: [10.0, 20.0, 110.0, 220.0],
-                            subject: None,
-                            confidence: Some(1.0),
-                        }])),
-                    });
-                    let report = compile_resolved(&resolved).unwrap();
-                    let bridged = bridge_resolved(&resolved, &opts).unwrap();
-                    black_box((report, bridged))
+        g.bench_with_input(BenchmarkId::new("resolve_compile_bridge", n), &n, |b, _| {
+            b.iter(|| {
+                let mut resolved =
+                    resolve_plan(black_box(&intent), black_box(&snap), policy.clone()).unwrap();
+                // Attach a few regions like a host would after materialize_masks.
+                resolved.resolved_masks.push(ResolvedMaskAsset {
+                    mask_id: None,
+                    mask_ref: None,
+                    subject: resolved.resolved_subjects.first().map(|s| s.id.clone()),
+                    range: None,
+                    fidelity: MaskFidelity::BBoxProxy,
+                    artifact: Some(MaskArtifact::from_regions(vec![RegionSample {
+                        at: MediaTime::new(0, 1_000_000_000),
+                        box_xyxy: [10.0, 20.0, 110.0, 220.0],
+                        subject: None,
+                        confidence: Some(1.0),
+                        geometry: None,
+                    }])),
                 });
-            },
-        );
+                let report = compile_resolved(&resolved).unwrap();
+                let bridged = bridge_resolved(&resolved, &opts).unwrap();
+                black_box((report, bridged))
+            });
+        });
     }
     g.finish();
 }
@@ -243,6 +242,7 @@ fn bench_mask_timeline(c: &mut Criterion) {
                 box_xyxy: [i as f32, 0.0, i as f32 + 40.0, 40.0],
                 subject: None,
                 confidence: Some(0.8),
+                geometry: None,
             })
             .collect();
         g.bench_with_input(BenchmarkId::new("from_regions", n), &n, |b, _| {

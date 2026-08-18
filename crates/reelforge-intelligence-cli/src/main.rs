@@ -7,15 +7,16 @@
     clippy::needless_pass_by_value,
     clippy::similar_names,
     clippy::assigning_clones,
-    clippy::collapsible_if
+    clippy::collapsible_if,
+    clippy::large_enum_variant
 )]
 
 use clap::{Parser, Subcommand};
 use reelforge_intelligence_core::{
-    BridgeOptions, IntelligenceService, MaskFidelity, MaskRequest, SemanticEditPlan, dispatch,
-    list_methods,
+    BridgeOptions, IntelligenceService, MaskFidelity, MaskRequest, RedactionKind, SemanticEditPlan,
+    bindings_from_value, dispatch, list_methods, rewrite_selectors,
 };
-use reelforge_intelligence_sightloom::load_package;
+use reelforge_intelligence_sightloom::{export_and_pin_mask_package, load_package};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -54,8 +55,12 @@ enum Commands {
         #[arg(long)]
         args_file: Option<PathBuf>,
     },
-    /// Line-delimited stdio MCP host (`{"id","method","args"}` per line).
-    Serve,
+    /// JSON-RPC 2.0 MCP host on stdio. Use `--legacy` for the old line protocol.
+    Serve {
+        /// Previous non-MCP `{id,method,args}` line protocol.
+        #[arg(long, default_value_t = false)]
+        legacy: bool,
+    },
     /// Load package + intent → resolve → bridge → print/write graph.
     ResolveBridge {
         /// Path to VisionIndex package directory.
@@ -79,6 +84,18 @@ enum Commands {
         /// Require privacy approval before bridge (default false for offline tooling).
         #[arg(long, default_value_t = false)]
         require_approval: bool,
+        /// Mask fidelity: `preview` (bbox) or `final` (true geometry, fail/review if missing).
+        #[arg(long, default_value = "preview")]
+        mode: String,
+        /// Write a ReelForge MaskPackage (`manifest.json` + `masks/*.bin`) here.
+        #[arg(long)]
+        write_mask_package: Option<PathBuf>,
+        /// Host FramePick bindings JSON (array or `{ "bindings": [...] }`).
+        #[arg(long)]
+        bindings: Option<PathBuf>,
+        /// Redaction style: `gaussian` (default), `pixelate`, `solid`.
+        #[arg(long, default_value = "gaussian")]
+        style: String,
     },
 }
 
@@ -135,7 +152,13 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("{}", serde_json::to_string_pretty(&result).map_err(ser)?);
             Ok(())
         }
-        Commands::Serve => serve_stdio(),
+        Commands::Serve { legacy } => {
+            if legacy {
+                serve_stdio_legacy()
+            } else {
+                serve_stdio_mcp()
+            }
+        }
         Commands::ResolveBridge {
             package,
             plan,
@@ -144,6 +167,10 @@ fn run(cli: Cli) -> Result<(), String> {
             write_graph,
             write_report,
             require_approval,
+            mode,
+            write_mask_package,
+            bindings,
+            style,
         } => resolve_bridge(
             &package,
             &plan,
@@ -152,6 +179,10 @@ fn run(cli: Cli) -> Result<(), String> {
             write_graph.as_deref(),
             write_report.as_deref(),
             require_approval,
+            &mode,
+            write_mask_package.as_deref(),
+            bindings.as_deref(),
+            &style,
         ),
     }
 }
@@ -164,7 +195,35 @@ fn load_args(inline: &str, file: Option<&Path>) -> Result<Value, String> {
     serde_json::from_str(inline).map_err(|e| format!("parse --args: {e}"))
 }
 
-fn serve_stdio() -> Result<(), String> {
+fn serve_stdio_mcp() -> Result<(), String> {
+    use reelforge_intelligence_core::handle_jsonrpc;
+    let svc = IntelligenceService::new();
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|e| format!("stdin: {e}"))?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(resp) = handle_jsonrpc(&svc, line) {
+            if resp.get("result").and_then(Value::as_bool) == Some(true)
+                && line.contains("\"shutdown\"")
+            {
+                let text = serde_json::to_string(&resp).map_err(ser)?;
+                writeln!(stdout, "{text}").map_err(|e| format!("stdout: {e}"))?;
+                stdout.flush().map_err(|e| format!("stdout flush: {e}"))?;
+                break;
+            }
+            let text = serde_json::to_string(&resp).map_err(ser)?;
+            writeln!(stdout, "{text}").map_err(|e| format!("stdout: {e}"))?;
+            stdout.flush().map_err(|e| format!("stdout flush: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn serve_stdio_legacy() -> Result<(), String> {
     let svc = IntelligenceService::new();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -223,6 +282,7 @@ fn write_line(out: &mut impl Write, resp: &ServeResponse) -> Result<(), String> 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn resolve_bridge(
     package: &Path,
     plan_path: &Path,
@@ -231,8 +291,15 @@ fn resolve_bridge(
     graph_out: Option<&Path>,
     report_out: Option<&Path>,
     require_approval: bool,
+    mode: &str,
+    mask_package_out: Option<&Path>,
+    bindings_path: Option<&Path>,
+    style: &str,
 ) -> Result<(), String> {
-    let loaded = load_package(package).map_err(|e| format!("package: {e}"))?;
+    let mut loaded = load_package(package).map_err(|e| format!("package: {e}"))?;
+    if let Some(dest) = mask_package_out {
+        export_and_pin_mask_package(&mut loaded, dest).map_err(|e| format!("mask package: {e}"))?;
+    }
     let plan_text = fs::read_to_string(plan_path).map_err(|e| format!("read plan: {e}"))?;
     let mut plan = SemanticEditPlan::from_json(&plan_text).map_err(|e| e.to_string())?;
     if let Some(m) = media {
@@ -240,12 +307,20 @@ fn resolve_bridge(
     } else if plan.media.trim().is_empty() {
         plan.media.clone_from(&loaded.snapshot.media);
     }
+    if let Some(path) = bindings_path {
+        let text = fs::read_to_string(path).map_err(|e| format!("read bindings: {e}"))?;
+        let value: Value =
+            serde_json::from_str(&text).map_err(|e| format!("parse bindings: {e}"))?;
+        let bindings = bindings_from_value(&value).map_err(|e| e.to_string())?;
+        plan = rewrite_selectors(plan, &bindings).map_err(|e| e.to_string())?;
+    }
     let svc = IntelligenceService::new();
     let mut resolved = svc
         .resolve_plan(&plan, &loaded.snapshot)
         .map_err(|e| e.to_string())?;
 
-    // Preview bbox → MaskTimeline when package has subject boxes.
+    // Masks: preview = bbox proxy; final = true geometry with fail/review.
+    let final_mode = mode.eq_ignore_ascii_case("final");
     if !resolved.resolved_subjects.is_empty() {
         let subjects: Vec<_> = resolved
             .resolved_subjects
@@ -261,9 +336,11 @@ fn resolve_bridge(
         } else {
             resolved.resolved_ranges.clone()
         };
-        if let Some(span) = ranges.first().copied() {
-            let request = if ranges.len() == 1 {
-                MaskRequest::preview_subjects(subjects, span)
+        if !ranges.is_empty() {
+            let request = if final_mode {
+                MaskRequest::final_subjects(subjects, ranges)
+            } else if ranges.len() == 1 {
+                MaskRequest::preview_subjects(subjects, ranges[0])
             } else {
                 MaskRequest {
                     subjects,
@@ -274,17 +351,44 @@ fn resolve_bridge(
                 }
             };
             let provider = loaded.provider();
-            if let Ok(artifact) = svc.materialize_masks(&provider, &request)
-                && !artifact.regions.is_empty()
-            {
-                resolved = svc.with_mask_artifact(resolved, artifact);
+            match svc.materialize_masks(&provider, &request) {
+                Ok(artifact) => {
+                    if final_mode && !artifact.carries_true_geometry() {
+                        match resolved.policy.privacy.missing_mask {
+                            reelforge_intelligence_core::MissingMaskAction::Fail => {
+                                return Err(
+                                    "final mode: true mask geometry unavailable (missing_mask=fail)"
+                                        .into(),
+                                );
+                            }
+                            reelforge_intelligence_core::MissingMaskAction::Review => {
+                                resolved.warnings.push(
+                                    reelforge_intelligence_core::ResolutionWarning {
+                                        message:
+                                            "final mode: true geometry missing — review required"
+                                                .into(),
+                                        edit_index: None,
+                                    },
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !artifact.regions.is_empty() || artifact.geometry.is_some() {
+                        resolved = svc.with_mask_artifact(resolved, artifact);
+                    }
+                }
+                Err(e) if final_mode => return Err(format!("final masks: {e}")),
+                Err(_) => {}
             }
         }
     }
 
+    let redaction_kind = RedactionKind::parse(style).map_err(|e| e.to_string())?;
     let opts = BridgeOptions {
         output_uri: output,
         require_approval,
+        redaction_kind,
         ..BridgeOptions::default()
     };
     let (report, bridged) = svc
@@ -314,6 +418,8 @@ fn resolve_bridge(
             .sum::<usize>(),
         "bridge_warnings": bridged.warnings,
         "has_execution_plan": bridged.execution_plan.is_some(),
+        "mask_package_id": resolved.mask_package_id,
+        "mask_package_uri": resolved.mask_package_uri,
         "graph_nodes": bridged.graph.nodes.len(),
         "graph_json_preview": if graph_written {
             Value::String("(written to --write-graph)".into())

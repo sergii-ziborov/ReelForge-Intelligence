@@ -99,22 +99,22 @@ impl AnalysisProvider for SightLoomProvider {
                         .cmp(&b.source_ids.len())
                         .then_with(|| a.appearance_count.cmp(&b.appearance_count)),
                     FrequencyMetric::Duration => {
-                        (a.last_ticks - a.first_ticks).cmp(&(b.last_ticks - b.first_ticks))
+                        a.visible_duration_ticks().cmp(&b.visible_duration_ticks())
                     }
                 });
                 best.map(|s| vec![self.to_subject_result(s)])
                     .unwrap_or_default()
             }
             Some(SubjectSelector::SubjectSet { name }) => {
-                let lower = name.to_lowercase();
+                let Some(ids) = self.snapshot.subject_sets.get(name) else {
+                    return Err(IntelError::message(format!(
+                        "SightLoomProvider: subject set '{name}' is not in snapshot.subject_sets"
+                    )));
+                };
                 self.snapshot
                     .subjects
                     .iter()
-                    .filter(|s| {
-                        s.label
-                            .as_ref()
-                            .is_some_and(|l| l.to_lowercase().contains(&lower))
-                    })
+                    .filter(|s| ids.contains(&s.subject_id))
                     .map(|s| self.to_subject_result(s))
                     .collect()
             }
@@ -139,21 +139,36 @@ impl AnalysisProvider for SightLoomProvider {
         let mut out = Vec::new();
         match query {
             EventQuery::Custom { expr } => {
-                // Treat as anomaly kind filter.
+                let needle = expr.to_lowercase();
+                for e in &self.snapshot.events {
+                    if e.kind.to_lowercase().contains(&needle)
+                        || e.event_id.to_lowercase().contains(&needle)
+                    {
+                        out.push(event_from_row(e, self.index_id(), ts));
+                    }
+                }
                 for a in &self.snapshot.anomalies {
-                    if a.kind.to_lowercase().contains(&expr.to_lowercase()) {
+                    if a.kind.to_lowercase().contains(&needle) {
                         out.push(event_from_anomaly(a, self.index_id(), ts));
                     }
                 }
             }
-            EventQuery::ZoneEnters { .. } | EventQuery::IdleRanges { .. } => {
-                // Snapshot may not carry zone/idle tables yet — return empty with honesty.
+            EventQuery::ZoneEnters { zone_id } => {
+                for e in &self.snapshot.events {
+                    if e.zone_id == Some(*zone_id) {
+                        out.push(event_from_row(e, self.index_id(), ts));
+                    }
+                }
             }
-        }
-        // Always include anomalies as events for BuildAnomalyReel path.
-        if out.is_empty() {
-            for a in &self.snapshot.anomalies {
-                out.push(event_from_anomaly(a, self.index_id(), ts));
+            EventQuery::IdleRanges { min_seconds } => {
+                let min_ticks = crate::time::MediaTime::from_secs_f64(*min_seconds, ts).ticks;
+                for e in &self.snapshot.events {
+                    if e.kind.to_lowercase().contains("idle")
+                        && (e.end_ticks - e.start_ticks) >= min_ticks
+                    {
+                        out.push(event_from_row(e, self.index_id(), ts));
+                    }
+                }
             }
         }
         Ok(out)
@@ -162,62 +177,128 @@ impl AnalysisProvider for SightLoomProvider {
     fn materialize_masks(&self, request: &MaskRequest) -> Result<MaskArtifact> {
         let mut regions = Vec::new();
         let mut notes = Vec::new();
-        let at = request.ranges.first().map(|r| r.start).unwrap_or_default();
-
-        for sid in &request.subjects {
-            if sid.kind != crate::ids::EntityKind::Subject {
-                notes.push(format!("skip non-subject id {}", sid.as_uri()));
-                continue;
-            }
-            let bbox = self
-                .subject_boxes
-                .iter()
-                .find(|(id, _)| *id == sid.id)
-                .map(|(_, b)| *b);
-            match (request.fidelity, bbox) {
-                (MaskFidelity::BBoxProxy | MaskFidelity::TrueGeometry, Some(box_xyxy)) => {
-                    regions.push(RegionSample {
-                        at,
-                        box_xyxy,
-                        subject: Some(sid.clone()),
-                        confidence: None,
-                    });
-                    if request.fidelity == MaskFidelity::TrueGeometry {
-                        notes.push(format!(
-                            "subject {} true geometry not in snapshot — bbox proxy",
-                            sid.as_uri()
-                        ));
-                    }
+        let ts = self.snapshot.timescale.max(1);
+        let wanted: Vec<&NamespacedId> = request
+            .subjects
+            .iter()
+            .filter(|sid| {
+                if sid.kind == crate::ids::EntityKind::Subject {
+                    true
+                } else {
+                    notes.push(format!("skip non-subject id {}", sid.as_uri()));
+                    false
                 }
-                (_, None) => {
+            })
+            .collect();
+
+        for sid in &wanted {
+            let timed: Vec<_> = self
+                .snapshot
+                .mask_samples
+                .iter()
+                .filter(|s| s.subject_id == sid.id && in_requested_ranges(s.ticks, &request.ranges))
+                .collect();
+            if timed.is_empty() {
+                let bbox = self
+                    .subject_boxes
+                    .iter()
+                    .find(|(id, _)| *id == sid.id)
+                    .map(|(_, b)| *b)
+                    .or_else(|| {
+                        self.snapshot
+                            .subject_boxes
+                            .iter()
+                            .find(|(id, _)| *id == sid.id)
+                            .map(|(_, b)| *b)
+                    });
+                let Some(box_xyxy) = bbox else {
                     notes.push(format!(
                         "missing mask/box for {} — privacy missing_mask policy applies",
                         sid.as_uri()
                     ));
+                    continue;
+                };
+                let at = request.ranges.first().map(|r| r.start).unwrap_or_default();
+                regions.push(RegionSample {
+                    at,
+                    box_xyxy,
+                    subject: Some((*sid).clone()),
+                    confidence: None,
+                    geometry: None,
+                });
+                if request.fidelity == MaskFidelity::TrueGeometry {
+                    notes.push(format!(
+                        "subject {} has no timed geometry — bbox proxy",
+                        sid.as_uri()
+                    ));
                 }
+                continue;
+            }
+            for sample in timed {
+                let geometry = match request.fidelity {
+                    MaskFidelity::TrueGeometry => sample.geometry.clone(),
+                    MaskFidelity::BBoxProxy => None,
+                };
+                if request.fidelity == MaskFidelity::TrueGeometry && geometry.is_none() {
+                    notes.push(format!(
+                        "subject {} t={} true geometry missing — bbox at this sample",
+                        sid.as_uri(),
+                        sample.ticks
+                    ));
+                }
+                regions.push(RegionSample {
+                    at: MediaTime::new(sample.ticks, ts),
+                    box_xyxy: sample.box_xyxy,
+                    subject: Some((*sid).clone()),
+                    confidence: (sample.confidence > 0.0).then_some(sample.confidence),
+                    geometry,
+                });
             }
         }
 
-        let geometry = if request.fidelity == MaskFidelity::TrueGeometry {
-            regions.first().map(|r| MaskGeometry::BBox {
-                box_xyxy: r.box_xyxy,
-            })
+        let has_true = regions.iter().any(|r| {
+            r.geometry
+                .as_ref()
+                .is_some_and(|g| !matches!(g, MaskGeometry::BBox { .. }))
+        });
+        let fidelity = if request.fidelity == MaskFidelity::TrueGeometry && has_true {
+            MaskFidelity::TrueGeometry
         } else {
-            None
+            MaskFidelity::BBoxProxy
         };
 
         Ok(MaskArtifact {
-            fidelity: if geometry.is_some() && request.fidelity == MaskFidelity::TrueGeometry {
-                // Honest: still bbox until host supplies RLE/dense.
-                MaskFidelity::BBoxProxy
-            } else {
-                request.fidelity
-            },
+            fidelity,
             regions,
-            geometry,
+            geometry: None,
             mask_ids: request.mask_ids.clone(),
             notes,
         })
+    }
+}
+
+fn in_requested_ranges(ticks: i64, ranges: &[MediaRange]) -> bool {
+    if ranges.is_empty() {
+        return true;
+    }
+    ranges
+        .iter()
+        .any(|r| ticks >= r.start.ticks && ticks <= r.end.ticks)
+}
+
+fn event_from_row(e: &crate::resolve::EventEvidence, index_id: &str, ts: u32) -> EventResult {
+    EventResult {
+        event_id: e.event_id.clone(),
+        kind: e.kind.clone(),
+        subject: e
+            .subject_id
+            .map(|s| NamespacedId::sightloom_subject(index_id, s)),
+        range: MediaRange::new(
+            MediaTime::new(e.start_ticks, ts),
+            MediaTime::new(e.end_ticks, ts),
+        ),
+        hour_of_day: e.hour_of_day,
+        score: e.score,
     }
 }
 
@@ -252,15 +333,19 @@ mod tests {
             vision_index_generation: "gen-1".into(),
             vision_index_hash: "idx".into(),
             timescale: 1_000_000_000,
-            subjects: vec![SubjectEvidence {
-                subject_id: 184,
-                label: Some("alice".into()),
-                appearance_count: 5,
-                source_ids: vec![2, 5],
-                first_ticks: 0,
-                last_ticks: 10,
-                confidence: Some(0.9),
-            }],
+            subjects: vec![
+                SubjectEvidence {
+                    subject_id: 184,
+                    label: Some("alice".into()),
+                    appearance_count: 5,
+                    source_ids: vec![2, 5],
+                    first_ticks: 0,
+                    last_ticks: 10,
+                    confidence: Some(0.9),
+                    ..SubjectEvidence::default()
+                }
+                .with_visit(0, 10),
+            ],
             anomalies: vec![AnomalyEvidence {
                 anomaly_id: "9".into(),
                 subject_id: Some(184),
@@ -270,6 +355,7 @@ mod tests {
                 kind: "route".into(),
                 score: 0.8,
             }],
+            ..AnalysisSnapshot::default()
         }
     }
 
@@ -302,5 +388,61 @@ mod tests {
         assert_eq!(art.fidelity, MaskFidelity::BBoxProxy);
         assert!((art.regions[0].box_xyxy[0] - 1.0).abs() < 1e-6);
         assert!((art.regions[0].box_xyxy[3] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn timed_samples_and_true_geometry() {
+        let mut snap = snap();
+        snap.mask_samples = vec![
+            crate::resolve::MaskSampleEvidence {
+                subject_id: 184,
+                ticks: 0,
+                box_xyxy: [10.0, 10.0, 20.0, 20.0],
+                confidence: 0.8,
+                mask_ref: Some(3),
+                geometry: Some(MaskGeometry::Rle {
+                    width: 4,
+                    height: 1,
+                    counts: vec![0, 2, 2],
+                }),
+            },
+            crate::resolve::MaskSampleEvidence {
+                subject_id: 184,
+                ticks: 5,
+                box_xyxy: [12.0, 10.0, 22.0, 20.0],
+                confidence: 0.7,
+                mask_ref: Some(4),
+                geometry: Some(MaskGeometry::External {
+                    package_id: "gen-1".into(),
+                    mask_ref: 4,
+                }),
+            },
+            crate::resolve::MaskSampleEvidence {
+                subject_id: 184,
+                ticks: 99,
+                box_xyxy: [0.0, 0.0, 1.0, 1.0],
+                confidence: 0.1,
+                mask_ref: None,
+                geometry: None,
+            },
+        ];
+        let p = SightLoomProvider::new(snap);
+        let sub = NamespacedId::sightloom_subject("gen-1", 184);
+        let art = p
+            .materialize_masks(&MaskRequest::final_subjects(
+                vec![sub],
+                vec![MediaRange::new(
+                    MediaTime::new(0, 1_000_000_000),
+                    MediaTime::new(5, 1_000_000_000),
+                )],
+            ))
+            .unwrap();
+        assert_eq!(art.regions.len(), 2);
+        assert_eq!(art.fidelity, MaskFidelity::TrueGeometry);
+        assert!(art.carries_true_geometry());
+        assert!(matches!(
+            art.regions[0].geometry,
+            Some(MaskGeometry::Rle { .. })
+        ));
     }
 }

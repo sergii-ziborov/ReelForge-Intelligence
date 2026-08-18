@@ -17,6 +17,7 @@ pub const METHODS: &[&str] = &[
     "check_plan",
     "normalize_plan",
     "repair_plan",
+    "rewrite_selectors",
     "compile_plan",
     "resolve_plan",
     "compile_resolved",
@@ -34,6 +35,114 @@ pub const METHODS: &[&str] = &[
 #[must_use]
 pub fn list_methods() -> &'static [&'static str] {
     METHODS
+}
+
+/// JSON-RPC 2.0 protocol version advertised by [`handle_jsonrpc`].
+pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Handle one JSON-RPC 2.0 MCP message. Notifications return `None`.
+///
+/// # Errors
+///
+/// Never — protocol errors are encoded in the JSON-RPC response.
+#[must_use]
+pub fn handle_jsonrpc(svc: &IntelligenceService, raw: &str) -> Option<Value> {
+    let parsed: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return Some(jsonrpc_error(
+                &Value::Null,
+                -32700,
+                format!("parse error: {e}"),
+            ));
+        }
+    };
+    let id = parsed.get("id").cloned().unwrap_or(Value::Null);
+    let method = parsed.get("method").and_then(Value::as_str).unwrap_or("");
+    let params = parsed.get("params").cloned().unwrap_or(Value::Null);
+    let is_notification = parsed.get("id").is_none();
+
+    let result = match method {
+        "initialize" => Ok(serde_json::json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": { "tools": {} },
+            "serverInfo": {
+                "name": "reelforge-intelligence",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        })),
+        "notifications/initialized" | "initialized" => {
+            if is_notification {
+                return None;
+            }
+            Ok(Value::Object(serde_json::Map::new()))
+        }
+        "ping" => Ok(Value::Object(serde_json::Map::new())),
+        "tools/list" => Ok(serde_json::json!({ "tools": mcp_tools() })),
+        "tools/call" => match params.get("name").and_then(Value::as_str) {
+            None => Err(IntelError::message("tools/call: name required")),
+            Some(name) => {
+                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                dispatch(svc, name, &args).map(|value| {
+                    serde_json::json!({
+                        "content": [{ "type": "text", "text": value.to_string() }],
+                        "structuredContent": value
+                    })
+                })
+            }
+        },
+        "shutdown" => Ok(Value::Bool(true)),
+        "" => Err(IntelError::message("method required")),
+        other => {
+            // Compatibility: treat unknown JSON-RPC methods as Intelligence tools
+            // only when they are in METHODS; otherwise JSON-RPC -32601.
+            if METHODS.contains(&other) {
+                dispatch(svc, other, &params)
+            } else {
+                return Some(jsonrpc_error(
+                    &id,
+                    -32601,
+                    format!("method not found: {other}"),
+                ));
+            }
+        }
+    };
+
+    if is_notification {
+        return None;
+    }
+    match result {
+        Ok(value) => Some(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": value
+        })),
+        Err(e) => Some(jsonrpc_error(&id, -32603, e.to_string())),
+    }
+}
+
+fn mcp_tools() -> Vec<Value> {
+    METHODS
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "description": format!("ReelForge Intelligence method `{name}`"),
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": true
+                }
+            })
+        })
+        .collect()
+}
+
+fn jsonrpc_error(id: &Value, code: i64, message: impl Into<String>) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message.into() }
+    })
 }
 
 /// Dispatch one MCP-style call. Unknown methods error.
@@ -66,6 +175,15 @@ pub fn dispatch(svc: &IntelligenceService, method: &str, args: &Value) -> Result
         "repair_plan" => {
             let plan = plan_arg(args)?;
             Ok(serde_json::to_value(svc.repair_plan(plan)).unwrap_or(Value::Null))
+        }
+        "rewrite_selectors" => {
+            let plan = plan_arg(args)?;
+            let bindings =
+                crate::rewrite::bindings_from_value(args.get("bindings").unwrap_or(&Value::Null))?;
+            Ok(
+                serde_json::to_value(svc.rewrite_selectors(plan, &bindings)?)
+                    .unwrap_or(Value::Null),
+            )
         }
         "compile_plan" => {
             let plan = plan_arg(args)?;
@@ -114,19 +232,7 @@ pub fn dispatch(svc: &IntelligenceService, method: &str, args: &Value) -> Result
         }
         "compile_and_bridge" => {
             let resolved = resolved_arg(args)?;
-            let output = args
-                .get("output")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let require_approval = args
-                .get("require_approval")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let opts = crate::bridge::BridgeOptions {
-                output_uri: output,
-                require_approval,
-                ..crate::bridge::BridgeOptions::default()
-            };
+            let opts = bridge_opts_from_args(args)?;
             let (report, bridged) = svc.compile_and_bridge(&resolved, &opts)?;
             Ok(serde_json::json!({
                 "report": report,
@@ -145,14 +251,7 @@ pub fn dispatch(svc: &IntelligenceService, method: &str, args: &Value) -> Result
                 serde_json::from_value(ir.clone())
                     .map_err(|e| IntelError::message(e.to_string()))?
             };
-            let output = args
-                .get("output")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let opts = crate::bridge::BridgeOptions {
-                output_uri: output,
-                ..crate::bridge::BridgeOptions::default()
-            };
+            let opts = bridge_opts_from_args(args)?;
             let bridged = svc.bridge_graph(&ir, &opts)?;
             Ok(serde_json::json!({
                 "graph_json": bridged.graph_json,
@@ -170,6 +269,35 @@ pub fn dispatch(svc: &IntelligenceService, method: &str, args: &Value) -> Result
 #[must_use]
 pub fn service_with_catalog(catalog: HostCatalog) -> IntelligenceService {
     IntelligenceService::new().with_catalog(catalog)
+}
+
+fn bridge_opts_from_args(args: &Value) -> Result<crate::bridge::BridgeOptions> {
+    let output = args
+        .get("output")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let require_approval = args
+        .get("require_approval")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut opts = crate::bridge::BridgeOptions {
+        output_uri: output,
+        require_approval,
+        ..crate::bridge::BridgeOptions::default()
+    };
+    if let Some(style) = args.get("style").and_then(Value::as_str) {
+        opts.redaction_kind = crate::bridge::RedactionKind::parse(style)?;
+    }
+    if let Some(block) = args.get("pixelate_block").and_then(Value::as_u64) {
+        opts.pixelate_block = u16::try_from(block).unwrap_or(u16::MAX).max(2);
+    }
+    if let Some(sigma) = args.get("redaction_sigma").and_then(Value::as_f64) {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+        {
+            opts.redaction_sigma = sigma as f32;
+        }
+    }
+    Ok(opts)
 }
 
 fn plan_arg(args: &Value) -> Result<SemanticEditPlan> {
@@ -275,8 +403,67 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_rewrite_selectors() {
+        let svc = IntelligenceService::new();
+        let args = serde_json::json!({
+            "plan": {
+                "version": 2,
+                "media": "cam",
+                "edits": [{
+                    "type": "blur_subject",
+                    "subject": {
+                        "kind": "frame_pick",
+                        "media": "cam",
+                        "frame_index": 0,
+                        "box_xyxy": [1.0, 2.0, 3.0, 4.0]
+                    }
+                }]
+            },
+            "bindings": [{
+                "media": "cam",
+                "frame_index": 0,
+                "box_xyxy": [1.0, 2.0, 3.0, 4.0],
+                "ids": [9]
+            }]
+        });
+        let out = dispatch(&svc, "rewrite_selectors", &args).unwrap();
+        assert_eq!(out["edits"][0]["subject"]["kind"], "subject_ids");
+        assert_eq!(out["edits"][0]["subject"]["ids"][0], 9);
+    }
+
+    #[test]
     fn unknown_method_errors() {
         let svc = IntelligenceService::new();
         assert!(dispatch(&svc, "hack_the_planet", &Value::Null).is_err());
+    }
+
+    #[test]
+    fn jsonrpc_initialize_and_tools_call() {
+        let svc = IntelligenceService::new();
+        let init = handle_jsonrpc(
+            &svc,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(init["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+        let listed =
+            handle_jsonrpc(&svc, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
+        assert!(listed["result"]["tools"].as_array().unwrap().len() >= 4);
+        let call = handle_jsonrpc(
+            &svc,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_methods","arguments":{}}}"#,
+        )
+        .unwrap();
+        assert!(
+            call["result"]["structuredContent"]
+                .as_array()
+                .unwrap()
+                .len()
+                >= 4
+        );
+        let missing = handle_jsonrpc(&svc, r#"{"jsonrpc":"2.0","id":4,"method":"nope"}"#).unwrap();
+        assert_eq!(missing["error"]["code"], -32601);
+        let bad = handle_jsonrpc(&svc, "not-json").unwrap();
+        assert_eq!(bad["error"]["code"], -32700);
     }
 }

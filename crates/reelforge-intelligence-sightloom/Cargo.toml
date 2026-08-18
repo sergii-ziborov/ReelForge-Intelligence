@@ -14,12 +14,13 @@ readme = "README.md"
 
 [dependencies]
 reelforge-intelligence-core = { path = "../reelforge-intelligence-core", version = "0.1.0" }
-sightloom-index = { version = "0.1.4", features = ["package", "std"] }
-sightloom-core = { version = "0.1.4", default-features = false, features = ["std"] }
-sightloom-analysis = { version = "0.1.4", default-features = false, features = ["std"] }
+sightloom-index = { workspace = true, features = ["package", "std"] }
+sightloom-core = { workspace = true, default-features = false, features = ["std"] }
+sightloom-analysis = { workspace = true, default-features = false, features = ["std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -13,7 +13,7 @@ cargo run -p reelforge-intelligence-cli -- --help
 | `methods` | List MCP method names |
 | `dispatch --method M --args '{...}'` | One-shot JSON call |
 | `serve` | Line-delimited stdio MCP host |
-| `resolve-bridge` | Load SightLoom package + intent → freeze → live graph JSON |
+| `resolve-bridge` | Load SightLoom package + intent → freeze → live graph JSON (`--bindings` rewrites FramePick) |
 | `version` | Print crate version |
 
 ## Stdio protocol (`serve`)
@@ -45,8 +45,11 @@ cargo run -p reelforge-intelligence-cli -- resolve-bridge \
   --package /path/to/vision_index_package \
   --plan intent.json \
   --output out.mp4 \
-  --write-graph graph.json
+  --write-graph graph.json \
+  --style gaussian
 ```
+
+`--style`: `gaussian` (default) | `pixelate` | `solid`. Privacy hosts should pick `pixelate`.
 
 ## MCP methods
 

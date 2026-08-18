@@ -79,7 +79,7 @@ impl MaskRequest {
 }
 
 /// One regional sample for ReelForge MaskTimeline / RegionRedaction.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RegionSample {
     /// Media time of this sample.
     pub at: MediaTime,
@@ -91,6 +91,9 @@ pub struct RegionSample {
     /// Confidence of the region.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f32>,
+    /// True geometry for this sample when known (RLE / dense / polygon).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry: Option<MaskGeometry>,
 }
 
 /// Encoded true-geometry payload (opaque to ReelForge until host decodes).
@@ -125,6 +128,13 @@ pub enum MaskGeometry {
     BBox {
         /// Box.
         box_xyxy: [f32; 4],
+    },
+    /// Silhouette stays in the SightLoom package; host/ReelForge resolves pixels.
+    External {
+        /// Package / generation id.
+        package_id: String,
+        /// Mask store handle.
+        mask_ref: u64,
     },
 }
 
@@ -171,6 +181,17 @@ impl MaskArtifact {
             mask_ids: Vec::new(),
             notes: Vec::new(),
         }
+    }
+
+    /// True RLE/dense/polygon payload is present (bbox-only is not enough).
+    #[must_use]
+    pub fn carries_true_geometry(&self) -> bool {
+        let is_true = |g: &MaskGeometry| !matches!(g, MaskGeometry::BBox { .. });
+        self.geometry.as_ref().is_some_and(is_true)
+            || self
+                .regions
+                .iter()
+                .any(|r| r.geometry.as_ref().is_some_and(is_true))
     }
 
     /// Build bbox-proxy artifact from samples.

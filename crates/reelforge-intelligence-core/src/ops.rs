@@ -44,6 +44,10 @@ pub fn operations() -> &'static [IntelOperation] {
             id: "create_event_clips",
             summary: "Cut clips around events matching a query",
         },
+        IntelOperation {
+            id: "redact_pii",
+            summary: "Redact license plates, screens, text, or documents (fail-closed)",
+        },
     ]
 }
 
@@ -100,6 +104,18 @@ pub fn schemas() -> serde_json::Value {
                 "pad_before_secs": { "type": "number" },
                 "pad_after_secs": { "type": "number" }
             }
+        },
+        "redact_pii": {
+            "type": "object",
+            "properties": {
+                "kinds": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["license_plate", "screen", "text", "document"]
+                    }
+                }
+            }
         }
     })
 }
@@ -115,5 +131,6 @@ pub fn edit_op_id(edit: &SemanticEdit) -> &'static str {
         SemanticEdit::BuildMostFrequentSubjectReel { .. } => "build_most_frequent_subject_reel",
         SemanticEdit::BuildAnomalyReel { .. } => "build_anomaly_reel",
         SemanticEdit::CreateEventClips { .. } => "create_event_clips",
+        SemanticEdit::RedactPii { .. } => "redact_pii",
     }
 }

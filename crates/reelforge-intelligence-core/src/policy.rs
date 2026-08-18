@@ -31,6 +31,8 @@ pub enum MissingMaskAction {
     Skip,
     /// Fail resolve / require review.
     Review,
+    /// Hard-fail when true geometry is required and missing.
+    Fail,
 }
 
 /// Low identity / detection confidence behaviour.

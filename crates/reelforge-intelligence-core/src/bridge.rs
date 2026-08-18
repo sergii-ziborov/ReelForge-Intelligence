@@ -5,17 +5,49 @@
 
 use crate::error::{IntelError, Result};
 use crate::mask_timeline::{mask_timeline_from_resolved, timeline_has_samples};
-use crate::render_graph::{GraphNodeKind, RenderGraphIr, graph_from_resolved, op_id};
+use crate::render_graph::{GraphNode, GraphNodeKind, RenderGraphIr, graph_from_resolved, op_id};
 use crate::resolved::ResolvedEditPlan;
+use reelforge_core::Rgba8;
 use reelforge_render_graph::{
-    BackendClass, CapabilitySet, ExecutionPlan, GraphOutput, MaskTimeline, MediaAsset,
-    MediaAssetId, MediaContract, NodeId, OperationDescriptor, OperationId, OperationLimits,
-    OperationRegistry, RENDER_GRAPH_VERSION, RegionRedaction, RenderGraph, RenderNode,
-    RenderNodeKind, SemVer, schedule_graph,
+    BackendClass, ExecutionPlan, GraphOutput, MaskTimeline, MediaAsset, MediaAssetId,
+    MediaContract, NodeId, OperationDescriptor, OperationId, OperationRegistry,
+    RENDER_GRAPH_VERSION, RedactionStyle, RegionRedaction, RenderGraph, RenderNode, RenderNodeKind,
+    SemVer, schedule_graph,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+
+/// How Intelligence materializes fused redaction (gaussian is recoverable).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedactionKind {
+    /// Gaussian blur (legacy / preview). Recoverable — not anonymity.
+    #[default]
+    Gaussian,
+    /// Pixelate (preferred privacy default for hosts).
+    Pixelate,
+    /// Solid fill.
+    Solid,
+}
+
+impl RedactionKind {
+    /// Parse `gaussian` / `pixelate` / `solid` (aliases: `blur`, `mosaic`, `black`).
+    ///
+    /// # Errors
+    ///
+    /// Unknown token.
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "gaussian" | "blur" => Ok(Self::Gaussian),
+            "pixelate" | "mosaic" => Ok(Self::Pixelate),
+            "solid" | "black" => Ok(Self::Solid),
+            other => Err(IntelError::message(format!(
+                "unknown redaction style `{other}` (gaussian|pixelate|solid)"
+            ))),
+        }
+    }
+}
 
 /// Options for IR → ReelForge conversion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -26,6 +58,12 @@ pub struct BridgeOptions {
     /// Gaussian sigma when materializing empty redaction nodes.
     #[serde(default = "default_sigma")]
     pub redaction_sigma: f32,
+    /// Redaction appearance. Default stays gaussian for existing callers.
+    #[serde(default)]
+    pub redaction_kind: RedactionKind,
+    /// Pixelate block size (pixels).
+    #[serde(default = "default_pixelate_block")]
+    pub pixelate_block: u16,
     /// Fallback trim duration (seconds) when IR has no usable range.
     #[serde(default = "default_trim_secs")]
     pub default_trim_duration_secs: f64,
@@ -41,6 +79,10 @@ fn default_sigma() -> f32 {
     12.0
 }
 
+fn default_pixelate_block() -> u16 {
+    16
+}
+
 fn default_trim_secs() -> f64 {
     1.0
 }
@@ -54,6 +96,8 @@ impl Default for BridgeOptions {
         Self {
             output_uri: None,
             redaction_sigma: default_sigma(),
+            redaction_kind: RedactionKind::Gaussian,
+            pixelate_block: default_pixelate_block(),
             default_trim_duration_secs: default_trim_secs(),
             require_approval: false,
             schedule: true,
@@ -76,6 +120,24 @@ pub struct BridgeResult {
     pub execution_plan: Option<ExecutionPlan>,
 }
 
+fn materialize_redaction(timeline: MaskTimeline, opts: &BridgeOptions) -> RegionRedaction {
+    match opts.redaction_kind {
+        RedactionKind::Gaussian => RegionRedaction::gaussian(timeline, opts.redaction_sigma),
+        RedactionKind::Pixelate => RegionRedaction {
+            masks: timeline,
+            style: RedactionStyle::Pixelate {
+                block_size: opts.pixelate_block.max(2),
+            },
+        },
+        RedactionKind::Solid => RegionRedaction {
+            masks: timeline,
+            style: RedactionStyle::Solid {
+                color: Rgba8::BLACK,
+            },
+        },
+    }
+}
+
 /// Convert typed Intelligence IR into a ReelForge `RenderGraph`.
 ///
 /// Prefer [`bridge_resolved`] when you still have the freeze (fills masks).
@@ -89,7 +151,7 @@ pub struct BridgeResult {
 /// | `rf.redaction.region` | fused `Redaction` (`MaskTimeline` from freeze when present) |
 /// | `rf.transform.trim` | `Op` with `start` + `duration` |
 /// | `rf.transform.crop` | `Op` when `w`/`h` present; else skip + warn |
-/// | `rf.transform.concat` | multi-range → trims + `rf.compose.layers` |
+/// | `rf.timeline.concat` | multi-range → trims + sequential concat |
 ///
 /// # Errors
 ///
@@ -193,10 +255,7 @@ pub fn bridge_to_reelforge_with_masks(
                         nodes.push(RenderNode {
                             id: NodeId(n.id.clone()),
                             body: RenderNodeKind::Redaction {
-                                redaction: RegionRedaction::gaussian(
-                                    timeline,
-                                    opts.redaction_sigma,
-                                ),
+                                redaction: materialize_redaction(timeline, opts),
                             },
                             inputs,
                         });
@@ -259,77 +318,16 @@ pub fn bridge_to_reelforge_with_masks(
                             }
                         }
                     }
-                    op_id::TRANSFORM_CONCAT => {
-                        let ranges = extract_ranges(n.params.as_ref());
-                        if ranges.len() <= 1 {
-                            // Single clip: trim is enough; multi-input compose needs ≥2.
-                            let (params, note) = if ranges.len() == 1 {
-                                trim_from_range(&ranges[0], opts.default_trim_duration_secs)
-                            } else {
-                                normalize_trim_params(
-                                    n.params.as_ref(),
-                                    opts.default_trim_duration_secs,
-                                )
-                            };
-                            if let Some(note) = note {
-                                warnings.push(format!("{}: {note}", n.id));
-                            }
-                            warnings
-                                .push(format!("{}: concat→trim (single range / whole span)", n.id));
-                            nodes.push(RenderNode {
-                                id: NodeId(n.id.clone()),
-                                body: RenderNodeKind::Op {
-                                    operation: OperationId::new(op_id::TRANSFORM_TRIM),
-                                    params,
-                                },
-                                inputs,
-                            });
-                            id_map.insert(n.id.clone(), n.id.clone());
-                        } else {
-                            let Some(NodeId(src)) = prev else {
-                                return Err(IntelError::message(format!(
-                                    "bridge: concat `{}` needs an input",
-                                    n.id
-                                )));
-                            };
-                            let mut trim_ids = Vec::new();
-                            for (i, range) in ranges.iter().enumerate() {
-                                let tid = format!("{}_t{i}", n.id);
-                                let (params, note) =
-                                    trim_from_range(range, opts.default_trim_duration_secs);
-                                if let Some(note) = note {
-                                    warnings.push(format!("{tid}: {note}"));
-                                }
-                                nodes.push(RenderNode {
-                                    id: NodeId(tid.clone()),
-                                    body: RenderNodeKind::Op {
-                                        operation: OperationId::new(op_id::TRANSFORM_TRIM),
-                                        params,
-                                    },
-                                    inputs: vec![NodeId(src.clone())],
-                                });
-                                trim_ids.push(NodeId(tid));
-                            }
-                            let layers: Vec<Value> = trim_ids
-                                .iter()
-                                .enumerate()
-                                .map(|(i, _)| json!({ "start": i as f64 }))
-                                .collect();
-                            nodes.push(RenderNode {
-                                id: NodeId(n.id.clone()),
-                                body: RenderNodeKind::Op {
-                                    operation: OperationId::new("rf.compose.layers"),
-                                    params: json!({ "layers": layers }),
-                                },
-                                inputs: trim_ids,
-                            });
-                            id_map.insert(n.id.clone(), n.id.clone());
-                            warnings.push(format!(
-                                "{}: concat expanded to {} trims + rf.compose.layers",
-                                n.id,
-                                ranges.len()
-                            ));
-                        }
+                    op_id::TIMELINE_CONCAT | "rf.transform.concat" => {
+                        emit_timeline_concat(
+                            n,
+                            &inputs,
+                            prev.as_ref(),
+                            opts,
+                            &mut nodes,
+                            &mut id_map,
+                            &mut warnings,
+                        )?;
                     }
                     other => {
                         // Pass through if registry knows the op; else skip.
@@ -431,36 +429,96 @@ pub fn bridge_to_reelforge_with_masks(
     })
 }
 
+fn emit_timeline_concat(
+    n: &GraphNode,
+    inputs: &[NodeId],
+    prev: Option<&NodeId>,
+    opts: &BridgeOptions,
+    nodes: &mut Vec<RenderNode>,
+    id_map: &mut HashMap<String, String>,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let ranges = extract_ranges(n.params.as_ref());
+    if ranges.len() <= 1 {
+        let (params, note) = if ranges.len() == 1 {
+            trim_from_range(&ranges[0], opts.default_trim_duration_secs)
+        } else {
+            normalize_trim_params(n.params.as_ref(), opts.default_trim_duration_secs)
+        };
+        if let Some(note) = note {
+            warnings.push(format!("{}: {note}", n.id));
+        }
+        warnings.push(format!("{}: concat→trim (single range / whole span)", n.id));
+        nodes.push(RenderNode {
+            id: NodeId(n.id.clone()),
+            body: RenderNodeKind::Op {
+                operation: OperationId::new(op_id::TRANSFORM_TRIM),
+                params,
+            },
+            inputs: inputs.to_vec(),
+        });
+        id_map.insert(n.id.clone(), n.id.clone());
+        return Ok(());
+    }
+
+    let Some(NodeId(src)) = prev else {
+        return Err(IntelError::message(format!(
+            "bridge: concat `{}` needs an input",
+            n.id
+        )));
+    };
+    let mut trim_ids = Vec::new();
+    let mut clips = Vec::new();
+    for (i, range) in ranges.iter().enumerate() {
+        let tid = format!("{}_t{i}", n.id);
+        let (params, note) = trim_from_range(range, opts.default_trim_duration_secs);
+        if let Some(note) = note {
+            warnings.push(format!("{tid}: {note}"));
+        }
+        clips.push(params.clone());
+        nodes.push(RenderNode {
+            id: NodeId(tid.clone()),
+            body: RenderNodeKind::Op {
+                operation: OperationId::new(op_id::TRANSFORM_TRIM),
+                params,
+            },
+            inputs: vec![NodeId(src.clone())],
+        });
+        trim_ids.push(NodeId(tid));
+    }
+    nodes.push(RenderNode {
+        id: NodeId(n.id.clone()),
+        body: RenderNodeKind::Op {
+            operation: OperationId::new(op_id::TIMELINE_CONCAT),
+            params: json!({ "clips": clips }),
+        },
+        inputs: trim_ids,
+    });
+    id_map.insert(n.id.clone(), n.id.clone());
+    warnings.push(format!(
+        "{}: concat expanded to {} sequential trims + rf.timeline.concat",
+        n.id,
+        ranges.len()
+    ));
+    Ok(())
+}
+
 /// Builtins plus Intelligence-facing adapter op (not yet on all crates.io tags).
 fn bridge_registry() -> OperationRegistry {
     let mut r = OperationRegistry::with_builtins();
     if r.get(&OperationId::new(op_id::ADAPTER_SIGHTLOOM)).is_err() {
-        r.register(OperationDescriptor {
-            id: OperationId::new(op_id::ADAPTER_SIGHTLOOM),
-            version: SemVer::V1,
-            input: MediaContract {
-                video: true,
-                audio: true,
-                masks: false,
-                notes: None,
-            },
-            output: MediaContract {
-                video: true,
-                audio: true,
-                masks: true,
-                notes: Some("video passthrough + masks".into()),
-            },
-            backend: BackendClass::Adapter,
-            deterministic: true,
-            capabilities: CapabilitySet {
-                tags: vec![
-                    "adapter".into(),
-                    "vision".into(),
-                    "privacy".into(),
-                    "sightloom".into(),
-                ],
-            },
-            parameter_schema: json!({
+        r.register(
+            OperationDescriptor::new(
+                op_id::ADAPTER_SIGHTLOOM,
+                SemVer::V1,
+                MediaContract::video_av(),
+                MediaContract::video_av()
+                    .with_masks()
+                    .with_notes("video passthrough + masks"),
+                BackendClass::Adapter,
+            )
+            .with_capabilities(["adapter", "vision", "privacy", "sightloom"])
+            .with_parameter_schema(json!({
                 "type": "object",
                 "properties": {
                     "subjects": { "type": "array" },
@@ -468,9 +526,27 @@ fn bridge_registry() -> OperationRegistry {
                     "vision_index_hash": { "type": "string" },
                     "adapter": { "type": "string" }
                 }
-            }),
-            limits: OperationLimits::default(),
-        });
+            })),
+        );
+    }
+    if r.get(&OperationId::new(op_id::TIMELINE_CONCAT)).is_err() {
+        r.register(
+            OperationDescriptor::nary(
+                op_id::TIMELINE_CONCAT,
+                SemVer::V1,
+                MediaContract::video_av().with_notes("n-ary sequential concat"),
+                MediaContract::video_av().with_notes("duration = sum of inputs"),
+                BackendClass::Rust,
+            )
+            .with_capabilities(["edit", "timeline", "concat"])
+            .with_parameter_schema(json!({
+                "type": "object",
+                "properties": {
+                    "clips": { "type": "array" },
+                    "ranges": { "type": "array" }
+                }
+            })),
+        );
     }
     r
 }
@@ -673,16 +749,21 @@ mod tests {
             vision_index_generation: "gen-1".into(),
             vision_index_hash: "idx".into(),
             timescale: 1_000_000_000,
-            subjects: vec![SubjectEvidence {
-                subject_id: 7,
-                label: Some("x".into()),
-                appearance_count: 9,
-                source_ids: vec![1],
-                first_ticks: 0,
-                last_ticks: 5_000_000_000,
-                confidence: Some(0.9),
-            }],
+            subjects: vec![
+                SubjectEvidence {
+                    subject_id: 7,
+                    label: Some("x".into()),
+                    appearance_count: 9,
+                    source_ids: vec![1],
+                    first_ticks: 0,
+                    last_ticks: 5_000_000_000,
+                    confidence: Some(0.9),
+                    ..SubjectEvidence::default()
+                }
+                .with_visit(0, 5_000_000_000),
+            ],
             anomalies: Vec::new(),
+            ..AnalysisSnapshot::default()
         }
     }
 
@@ -736,6 +817,45 @@ mod tests {
     }
 
     #[test]
+    fn redaction_kind_parse() {
+        assert_eq!(
+            RedactionKind::parse("blur").unwrap(),
+            RedactionKind::Gaussian
+        );
+        assert_eq!(
+            RedactionKind::parse("MOSAIC").unwrap(),
+            RedactionKind::Pixelate
+        );
+        assert_eq!(RedactionKind::parse("black").unwrap(), RedactionKind::Solid);
+        assert!(RedactionKind::parse("swirl").is_err());
+    }
+
+    #[test]
+    fn bridge_pixelate_is_not_gaussian() {
+        let intent = SemanticEditPlan::new("cam1").with_edit(SemanticEdit::BlurSubject {
+            subject: crate::selector::SubjectSelector::MostFrequent {
+                metric: FrequencyMetric::AppearanceCount,
+            },
+        });
+        let resolved = resolve_plan(&intent, &snap(), IntelligencePolicy::default()).unwrap();
+        let ir = graph_from_resolved(&resolved);
+        let opts = BridgeOptions {
+            redaction_kind: RedactionKind::Pixelate,
+            pixelate_block: 24,
+            ..BridgeOptions::default()
+        };
+        let result = bridge_to_reelforge(&ir, &opts).unwrap();
+        let style = result.graph.nodes.iter().find_map(|n| match &n.body {
+            RenderNodeKind::Redaction { redaction } => Some(&redaction.style),
+            _ => None,
+        });
+        assert!(
+            matches!(style, Some(RedactionStyle::Pixelate { block_size: 24 })),
+            "{style:?}"
+        );
+    }
+
+    #[test]
     fn bridge_resolved_fills_mask_samples() {
         use crate::mask::{MaskArtifact, RegionSample};
         use crate::resolved::ResolvedMaskAsset;
@@ -761,6 +881,7 @@ mod tests {
                 box_xyxy: [100.0, 100.0, 200.0, 300.0],
                 subject: resolved.resolved_subjects.first().map(|s| s.id.clone()),
                 confidence: Some(0.95),
+                geometry: None,
             }])),
         });
         let result = bridge_resolved(&resolved, &BridgeOptions::default()).unwrap();
@@ -792,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_range_concat_expands_to_layers() {
+    fn multi_range_concat_is_sequential() {
         use crate::render_graph::{
             ApprovalRecord, GraphAsset, GraphNode, GraphNodeKind, INTEL_RENDER_GRAPH_VERSION,
         };
@@ -821,7 +942,7 @@ mod tests {
                 GraphNode {
                     id: "reel".into(),
                     kind: GraphNodeKind::Op,
-                    operation: Some(op_id::TRANSFORM_CONCAT.into()),
+                    operation: Some(op_id::TIMELINE_CONCAT.into()),
                     inputs: vec!["src".into()],
                     asset: None,
                     name: None,
@@ -855,8 +976,42 @@ mod tests {
         let result = bridge_default(&ir).unwrap();
         assert!(result.graph.nodes.iter().any(|n| matches!(
             &n.body,
+            RenderNodeKind::Op { operation, .. } if operation.0 == op_id::TIMELINE_CONCAT
+        )));
+        assert!(!result.graph.nodes.iter().any(|n| matches!(
+            &n.body,
             RenderNodeKind::Op { operation, .. } if operation.0 == "rf.compose.layers"
         )));
+        let concat = result
+            .graph
+            .nodes
+            .iter()
+            .find_map(|n| match &n.body {
+                RenderNodeKind::Op { operation, params }
+                    if operation.0 == op_id::TIMELINE_CONCAT =>
+                {
+                    Some(params)
+                }
+                _ => None,
+            })
+            .expect("concat node");
+        let clips = concat
+            .get("clips")
+            .and_then(Value::as_array)
+            .expect("clips");
+        assert_eq!(clips.len(), 2);
+        assert_eq!(
+            result
+                .graph
+                .nodes
+                .iter()
+                .filter(|n| matches!(
+                    &n.body,
+                    RenderNodeKind::Op { operation, .. } if operation.0 == op_id::TRANSFORM_TRIM
+                ))
+                .count(),
+            2
+        );
         assert!(result.execution_plan.is_some());
     }
 }

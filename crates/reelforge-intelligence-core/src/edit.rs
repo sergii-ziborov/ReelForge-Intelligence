@@ -1,6 +1,7 @@
 //! Semantic edit plan document (intent — not frozen).
 
 use crate::error::{IntelError, Result};
+use crate::pii::PiiKind;
 use crate::policy::IntelligencePolicy;
 use crate::query::EventQuery;
 use crate::selector::SubjectSelector;
@@ -24,7 +25,7 @@ pub enum FrequencyMetric {
 }
 
 /// Framing policy for follow / crop.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FramingPolicy {
     /// Host default crop around subject.
@@ -110,6 +111,15 @@ pub enum SemanticEdit {
         /// Post-roll seconds.
         #[serde(default = "default_pad")]
         pad_after_secs: f64,
+    },
+    /// Redact non-person PII (plates, screens, text, documents).
+    ///
+    /// Empty `kinds` means every [`PiiKind`]. Missing evidence is an error —
+    /// Intelligence does not invent detections.
+    RedactPii {
+        /// Kinds to redact. Empty = all kinds.
+        #[serde(default)]
+        kinds: Vec<PiiKind>,
     },
 }
 
@@ -223,6 +233,18 @@ mod tests {
         assert!(json.contains("blur_everyone_except"));
         let back = SemanticEditPlan::from_json(&json).unwrap();
         assert_eq!(back.media, "assets/video-1");
+        assert_eq!(back.edits.len(), 1);
+    }
+
+    #[test]
+    fn redact_pii_roundtrip() {
+        let plan = SemanticEditPlan::new("v.mp4").with_edit(SemanticEdit::RedactPii {
+            kinds: vec![PiiKind::LicensePlate, PiiKind::Screen],
+        });
+        let json = plan.to_json_pretty().unwrap();
+        assert!(json.contains("redact_pii"));
+        assert!(json.contains("license_plate"));
+        let back = SemanticEditPlan::from_json(&json).unwrap();
         assert_eq!(back.edits.len(), 1);
     }
 }

@@ -12,7 +12,7 @@ use crate::time::{MediaRange, MediaTime};
 use serde::{Deserialize, Serialize};
 
 /// Schema version for [`ResolvedEditPlan`].
-pub const RESOLVED_EDIT_PLAN_VERSION: u32 = 2;
+pub const RESOLVED_EDIT_PLAN_VERSION: u32 = 3;
 
 /// One subject identity frozen from SightLoom (or host catalog).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -31,12 +31,23 @@ pub struct ResolvedSubject {
     /// Namespaced source ids when frozen.
     #[serde(default)]
     pub source_uris: Vec<NamespacedId>,
-    /// Appearance span when known.
+    /// Envelope from first to last seen (debug / blur coverage).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<MediaRange>,
+    /// Discrete visible appearances (reel ranges). Empty means unknown — do not invent a span.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub appearances: Vec<MediaRange>,
+    /// Sum of appearance durations in the snapshot timescale.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub visible_duration_ticks: i64,
     /// Peak identity confidence when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f32>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
 }
 
 /// One event / anomaly / visit frozen for the plan.
@@ -140,6 +151,21 @@ pub struct ResolvedEditPlan {
     /// When this freeze was taken (host wall clock ns, optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen_at_ns: Option<i64>,
+    /// Source frame width (follow-crop).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_width: Option<u32>,
+    /// Source frame height (follow-crop).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_height: Option<u32>,
+    /// Last-known subject boxes for follow-crop when masks are not yet attached.
+    #[serde(default)]
+    pub subject_boxes: Vec<(u64, [f32; 4])>,
+    /// ReelForge mask package id pinned at freeze.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_package_id: Option<String>,
+    /// Host path / URI of the MaskPackage directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_package_uri: Option<String>,
 }
 
 impl ResolvedEditPlan {
@@ -166,6 +192,11 @@ impl ResolvedEditPlan {
             policy: IntelligencePolicy::default(),
             intent: None,
             frozen_at_ns: None,
+            frame_width: None,
+            frame_height: None,
+            subject_boxes: Vec::new(),
+            mask_package_id: None,
+            mask_package_uri: None,
         }
     }
 

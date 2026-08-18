@@ -26,10 +26,16 @@ categories = ["multimedia", "multimedia::video"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
 clap = { version = "4", features = ["derive"] }
 criterion = { version = "0.5", features = ["html_reports"] }
-reelforge-core = "0.1.5"
-reelforge-render-graph = "0.1.5"
+reelforge-core = { path = "../ReelForge/crates/reelforge-core", version = "0.2.0" }
+reelforge-render-graph = { path = "../ReelForge/crates/reelforge-render-graph", version = "0.2.0" }
+sightloom-index = { path = "../SightLoom/crates/sightloom-index", version = "0.1.6", default-features = false }
+sightloom-core = { path = "../SightLoom/crates/sightloom-core", version = "0.1.6", default-features = false }
+sightloom-analysis = { path = "../SightLoom/crates/sightloom-analysis", version = "0.1.6", default-features = false }
 reelforge-intelligence-core = { path = "crates/reelforge-intelligence-core", version = "0.1.0" }
 reelforge-intelligence-sightloom = { path = "crates/reelforge-intelligence-sightloom", version = "0.1.0" }
 

@@ -150,9 +150,9 @@ Preview intent compile stays `final_graph: false`.
 | `rf.redaction.region` | fused `Redaction` (`MaskTimeline` from freeze when samples present) |
 | `rf.transform.trim` | `Op` with `start` + `duration` |
 | `rf.transform.crop` | `Op` when `w`/`h` set; else skip (framing → host) |
-| `rf.transform.concat` | multi-range → trims + `rf.compose.layers` |
+| `rf.timeline.concat` | multi-range → sequential trims + concat (not `compose.layers`) |
 
-Also: `schedule_graph` → `ExecutionPlan`, `HostRequest::Render.reelforge_graph_json`, MCP methods `compile_and_bridge` / `bridge_graph`.
+Also: `schedule_graph` → `ExecutionPlan`, `HostRequest::Render` (`reelforge_graph_json`, `mask_package_id`, `mask_package_uri`), MCP methods `compile_and_bridge` / `bridge_graph`.
 
 ```rust
 use reelforge_intelligence_core::{
@@ -175,10 +175,19 @@ No FFmpeg in Intelligence — only graph structure + schedule smoke.
 
 ```bash
 cargo run -p reelforge-intelligence-cli -- methods
-cargo run -p reelforge-intelligence-cli -- serve          # line JSON on stdio
+cargo run -p reelforge-intelligence-cli -- serve          # JSON-RPC 2.0 MCP on stdio
+cargo run -p reelforge-intelligence-cli -- serve --legacy # old line protocol
 cargo run -p reelforge-intelligence-cli -- resolve-bridge \
-  --package /path/to/vision_index --plan intent.json --write-graph out_graph.json
+  --package /path/to/vision_index --plan intent.json --write-graph out_graph.json \
+  --bindings hits.json \
+  --style gaussian
 ```
+
+`--style` / MCP `style`: `gaussian` (compiler default, recoverable) | `pixelate` | `solid`. Hosts that need anonymity should pass `pixelate`.
+
+`redact_pii` blurs plates / screens / text / documents already on the freeze. Missing evidence is an error — Intelligence does not detect PII. People stay on `blur_subject` / `blur_everyone_except`.
+
+Photo / `frame_pick` materialization is **host search + `rewrite_selectors`**. Intelligence never opens JPEGs. Host MCP method: `rewrite_selectors`. Then encode with `reelforge graph --run`.
 
 Binary name: `reelforge-intelligence`. No FFmpeg; host runs ReelForge after handoff.
 

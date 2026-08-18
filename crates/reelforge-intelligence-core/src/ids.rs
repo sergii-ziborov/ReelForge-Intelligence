@@ -74,6 +74,8 @@ pub enum EntityKind {
     Mask,
     /// Event / anomaly.
     Event,
+    /// Non-identity PII object (plate, screen, text).
+    Object,
 }
 
 impl EntityKind {
@@ -86,6 +88,7 @@ impl EntityKind {
             Self::Source => "sources",
             Self::Mask => "masks",
             Self::Event => "events",
+            Self::Object => "objects",
         }
     }
 
@@ -96,6 +99,7 @@ impl EntityKind {
             "sources" => Some(Self::Source),
             "masks" => Some(Self::Mask),
             "events" => Some(Self::Event),
+            "objects" => Some(Self::Object),
             _ => None,
         }
     }
@@ -153,6 +157,18 @@ impl NamespacedId {
             index_id: index_id.into(),
             kind: EntityKind::Source,
             id: u64::from(source_id),
+            source_id: None,
+        }
+    }
+
+    /// SightLoom PII object: `sightloom://{index}/objects/{id}`.
+    #[must_use]
+    pub fn sightloom_object(index_id: impl Into<String>, object_id: u64) -> Self {
+        Self {
+            namespace: AnalysisNamespace::SightLoom,
+            index_id: index_id.into(),
+            kind: EntityKind::Object,
+            id: object_id,
             source_id: None,
         }
     }
