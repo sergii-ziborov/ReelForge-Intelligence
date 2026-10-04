@@ -74,6 +74,25 @@ pub fn fingerprint_ir(ir: &RenderGraphIr) -> Result<String> {
     fingerprint_value(&value)
 }
 
+/// SHA-256 of the IR with approval binding fields cleared.
+///
+/// Those fields are excluded so a stored `ir_fingerprint` still matches after
+/// it is written onto the same record.
+///
+/// # Errors
+///
+/// Serde.
+pub(crate) fn fingerprint_ir_for_approval(ir: &RenderGraphIr) -> Result<String> {
+    let mut cleared = ir.clone();
+    cleared.approval.graph_fingerprint = None;
+    cleared.approval.ir_fingerprint = None;
+    cleared.approval.resolved_fingerprint = None;
+    cleared.approval.policy_hash = None;
+    cleared.approval.output_uri_hash = None;
+    cleared.approval.signature = None;
+    fingerprint_ir(&cleared)
+}
+
 /// Fingerprint a live graph JSON string (pretty or compact).
 ///
 /// # Errors

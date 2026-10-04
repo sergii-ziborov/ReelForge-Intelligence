@@ -61,8 +61,9 @@ mod sightloom_provider;
 mod time;
 
 pub use bridge::{
-    BridgeOptions, BridgeResult, RedactionKind, bridge_default, bridge_for_execute, bridge_resolved,
-    bridge_resolved_for_execute, bridge_to_reelforge, bridge_to_reelforge_with_masks,
+    BridgeOptions, BridgeResult, RedactionKind, bridge_default, bridge_for_execute,
+    bridge_resolved, bridge_resolved_for_execute, bridge_to_reelforge,
+    bridge_to_reelforge_with_masks,
 };
 pub use catalog::{HostCatalog, MediaInspection, SceneHit, SubjectHit};
 pub use compile::AnalysisProvider as AnalysisProviderDescriptor;

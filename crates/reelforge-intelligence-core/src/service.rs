@@ -2,6 +2,7 @@
 
 use crate::bridge::{
     BridgeOptions, BridgeResult, bridge_resolved, bridge_resolved_for_execute, bridge_to_reelforge,
+    bridge_to_reelforge_with_masks,
 };
 use crate::catalog::{HostCatalog, MediaInspection, SceneHit, SubjectHit};
 use crate::compile::{
@@ -10,6 +11,7 @@ use crate::compile::{
 use crate::edit::SemanticEditPlan;
 use crate::error::{IntelError, Result};
 use crate::mask::{MaskArtifact, MaskRequest};
+use crate::mask_timeline::{mask_timeline_from_resolved, timeline_has_samples};
 use crate::ops::{IntelOperation, edit_op_id, operations, schemas};
 use crate::policy::{IntelligencePolicy, UncertaintyPolicy};
 use crate::provider::AnalysisProvider;
@@ -327,16 +329,34 @@ impl IntelligenceService {
             .intent
             .as_ref()
             .and_then(|i| i.target_output.clone());
-        let bridged = bridge_resolved_for_execute(resolved, output.clone())?;
+        let Some(mut ir) = report.render_graph.clone() else {
+            return Err(IntelError::message(
+                "approve_and_render: compile report has no typed graph",
+            ));
+        };
+        // `bridge_resolved_for_execute` rebuilds IR via `graph_from_resolved`,
+        // which clears `approved`. Stamp this compile's approval and bind the
+        // IR fingerprint before the execute gate.
+        let ir_fp = crate::digest::fingerprint_ir_for_approval(&ir)?;
+        ir.approval.ir_fingerprint = Some(ir_fp.clone());
+        let masks = mask_timeline_from_resolved(resolved);
+        let mask_ref = if timeline_has_samples(&masks) {
+            Some(&masks)
+        } else {
+            None
+        };
+        let bridged = bridge_to_reelforge_with_masks(
+            &ir,
+            &BridgeOptions {
+                output_uri: output.clone(),
+                require_approval: true,
+                ..BridgeOptions::default()
+            },
+            mask_ref,
+        )?;
         report.reelforge_graph_json = Some(bridged.graph_json.clone());
         report.bridge_warnings = bridged.warnings;
         let graph_fp = crate::digest::fingerprint_graph_json(&bridged.graph_json)?;
-        let ir_fp = report
-            .render_graph
-            .as_ref()
-            .map(crate::digest::fingerprint_ir)
-            .transpose()?
-            .unwrap_or_default();
         let resolved_fp = crate::digest::fingerprint_resolved(resolved)?;
         let policy_fp = crate::digest::fingerprint_value(
             &serde_json::to_value(&resolved.policy).unwrap_or(serde_json::Value::Null),

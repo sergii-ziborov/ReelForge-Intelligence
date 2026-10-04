@@ -171,11 +171,8 @@ pub fn bridge_to_reelforge_with_masks(
     opts: &BridgeOptions,
     masks: Option<&MaskTimeline>,
 ) -> Result<BridgeResult> {
-    if opts.require_approval && !ir.approval.allows_execute() {
-        return Err(IntelError::message(format!(
-            "bridge: approval required ({})",
-            ir.approval.reasons.join(", ")
-        )));
+    if opts.require_approval {
+        gate_execute_approval(ir)?;
     }
 
     let mut warnings = Vec::new();
@@ -421,12 +418,68 @@ pub fn bridge_to_reelforge_with_masks(
         .to_json_pretty()
         .map_err(|e| IntelError::message(format!("bridge serialize: {e}")))?;
 
+    if opts.require_approval && ir.approval.approved {
+        gate_graph_fingerprint(ir, &graph_json)?;
+    }
+
     Ok(BridgeResult {
         graph,
         graph_json,
         warnings,
         execution_plan,
     })
+}
+
+/// Execute gate: expiry, required-but-not-approved, and artifact binding.
+fn gate_execute_approval(ir: &RenderGraphIr) -> Result<()> {
+    if !ir.approval.allows_execute() {
+        if ir.approval.is_expired() {
+            return Err(IntelError::message("bridge: approval expired"));
+        }
+        return Err(IntelError::message(format!(
+            "bridge: approval required ({})",
+            ir.approval.reasons.join(", ")
+        )));
+    }
+    // Not approved and not required: nothing to bind.
+    if !ir.approval.approved {
+        return Ok(());
+    }
+    let ir_fp = present_fp(ir.approval.ir_fingerprint.as_deref());
+    let graph_fp = present_fp(ir.approval.graph_fingerprint.as_deref());
+    if ir_fp.is_none() && graph_fp.is_none() {
+        return Err(IntelError::message(
+            "bridge: approval is not bound to an artifact",
+        ));
+    }
+    if let Some(expected) = ir_fp {
+        let actual = crate::digest::fingerprint_ir_for_approval(ir)?;
+        if actual != expected {
+            return Err(IntelError::message(
+                "bridge: approval is not bound to an artifact (ir fingerprint mismatch)",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// When a graph fingerprint was stored, it must match the graph just built.
+fn gate_graph_fingerprint(ir: &RenderGraphIr, graph_json: &str) -> Result<()> {
+    let Some(expected) = present_fp(ir.approval.graph_fingerprint.as_deref()) else {
+        return Ok(());
+    };
+    let actual = crate::digest::fingerprint_graph_json(graph_json)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(IntelError::message(
+            "bridge: approval is not bound to an artifact (graph fingerprint mismatch)",
+        ))
+    }
+}
+
+fn present_fp(value: Option<&str>) -> Option<&str> {
+    value.filter(|s| !s.is_empty())
 }
 
 fn emit_timeline_concat(
@@ -909,7 +962,102 @@ mod tests {
         assert!(ir.approval.required);
         assert!(bridge_for_execute(&ir, None).is_err());
         ir.approval = approve(ir.approval, "ops");
+        ir.approval.ir_fingerprint = Some(crate::digest::fingerprint_ir_for_approval(&ir).unwrap());
         assert!(bridge_for_execute(&ir, Some("out.mp4".into())).is_ok());
+    }
+
+    #[test]
+    fn execute_rejects_unbound_expired_and_tampered_approval() {
+        let mut ir = review_ir();
+        assert!(ir.approval.required);
+        ir.approval.approved = true;
+        ir.approval.expires_at_unix = Some(1);
+        assert!(bridge_for_execute(&ir, None).is_err());
+
+        ir.approval = approve(ir.approval, "ops");
+        ir.approval.expires_at_unix = None;
+        ir.approval.ir_fingerprint = None;
+        ir.approval.graph_fingerprint = None;
+        let unbound = bridge_for_execute(&ir, Some("out.mp4".into())).unwrap_err();
+        let unbound_text = unbound.to_string();
+        assert!(
+            unbound_text.contains("artifact") || unbound_text.contains("bound"),
+            "{unbound_text}"
+        );
+        // Inspection does not require a bound approval.
+        assert!(bridge_default(&ir).is_ok());
+
+        ir.approval.ir_fingerprint = Some(crate::digest::fingerprint_ir_for_approval(&ir).unwrap());
+        let preview = bridge_to_reelforge(
+            &ir,
+            &BridgeOptions {
+                output_uri: Some("out.mp4".into()),
+                require_approval: false,
+                ..BridgeOptions::default()
+            },
+        )
+        .unwrap();
+        ir.approval.graph_fingerprint =
+            Some(crate::digest::fingerprint_graph_json(&preview.graph_json).unwrap());
+        assert!(bridge_for_execute(&ir, Some("out.mp4".into())).is_ok());
+
+        ir.approval.graph_fingerprint = Some("flipped".into());
+        let flipped = bridge_for_execute(&ir, Some("out.mp4".into())).unwrap_err();
+        assert!(flipped.to_string().contains("artifact"), "{flipped}");
+
+        ir.approval.graph_fingerprint = None;
+        ir.approval.ir_fingerprint = Some(crate::digest::fingerprint_ir_for_approval(&ir).unwrap());
+        ir.nodes[0].params.as_mut().unwrap()["source_hash"] = json!("tampered-source");
+        assert!(bridge_for_execute(&ir, Some("out.mp4".into())).is_err());
+
+        let mut expired = review_ir();
+        expired.approval = approve(expired.approval, "ops");
+        expired.approval.ir_fingerprint =
+            Some(crate::digest::fingerprint_ir_for_approval(&expired).unwrap());
+        expired.approval.expires_at_unix = Some(1);
+        assert!(bridge_for_execute(&expired, Some("out.mp4".into())).is_err());
+        assert!(!expired.approval.allows_execute());
+    }
+
+    #[test]
+    fn approve_and_render_binds_required_approval() {
+        let intent =
+            SemanticEditPlan::new("cam1").with_edit(SemanticEdit::BuildMostFrequentSubjectReel {
+                metric: FrequencyMetric::AppearanceCount,
+            });
+        let mut policy = IntelligencePolicy::default();
+        policy.privacy.uncertain_identity = UncertaintyPolicy::Review;
+        policy.require_approve_on_review = true;
+        let resolved = resolve_plan(&intent, &snap(), policy).unwrap();
+        let svc = crate::service::IntelligenceService::new();
+        let (report, req) = svc.approve_and_render(&resolved, "operator").unwrap();
+        assert!(report.approval.required);
+        assert!(report.approval.approved);
+        assert!(report.approval.ir_fingerprint.is_some());
+        assert!(report.approval.graph_fingerprint.is_some());
+        assert!(report.allows_execute());
+        assert!(matches!(
+            req,
+            crate::service::HostRequest::Render {
+                reelforge_graph_json: Some(_),
+                ..
+            }
+        ));
+
+        let plain = resolve_plan(&intent, &snap(), IntelligencePolicy::default()).unwrap();
+        assert!(svc.approve_and_render(&plain, "operator").is_ok());
+    }
+
+    fn review_ir() -> RenderGraphIr {
+        let intent =
+            SemanticEditPlan::new("cam1").with_edit(SemanticEdit::BuildMostFrequentSubjectReel {
+                metric: FrequencyMetric::AppearanceCount,
+            });
+        let mut policy = IntelligencePolicy::default();
+        policy.privacy.uncertain_identity = UncertaintyPolicy::Review;
+        policy.require_approve_on_review = true;
+        let resolved = resolve_plan(&intent, &snap(), policy).unwrap();
+        graph_from_resolved(&resolved)
     }
 
     #[test]

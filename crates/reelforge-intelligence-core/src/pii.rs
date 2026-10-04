@@ -23,12 +23,7 @@ pub enum PiiKind {
 
 impl PiiKind {
     /// All kinds, stable order.
-    pub const ALL: [Self; 4] = [
-        Self::LicensePlate,
-        Self::Screen,
-        Self::Text,
-        Self::Document,
-    ];
+    pub const ALL: [Self; 4] = [Self::LicensePlate, Self::Screen, Self::Text, Self::Document];
 
     /// Snake_case token.
     #[must_use]

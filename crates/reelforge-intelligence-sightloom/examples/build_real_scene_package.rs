@@ -1,6 +1,6 @@
-//! Oracle host: two known people on a real composed mp4 → VisionIndex package.
+//! Oracle host: two known people on a real composed mp4 → `VisionIndex` package.
 //!
-//! This is **not** ONNX detection. It writes the document SightLoom would emit
+//! This is **not** ONNX detection. It writes the document `SightLoom` would emit
 //! after a host mapped photo→subject and boxed both people.
 
 use reelforge_intelligence_sightloom::encode_slm1_rle;
@@ -19,14 +19,15 @@ const ALICE: (f32, f32, f32, f32) = (80.0, 40.0, 560.0, 680.0);
 const BOB: (f32, f32, f32, f32) = (720.0, 40.0, 1200.0, 680.0);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let out = env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target/real-video-e2e/vision_index"));
+    let out = env::args().nth(1).map_or_else(
+        || PathBuf::from("target/real-video-e2e/vision_index"),
+        PathBuf::from,
+    );
     let media = env::args().nth(2).unwrap_or_else(|| {
-        std::fs::canonicalize("target/real-video-e2e/scene.mp4")
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "target/real-video-e2e/scene.mp4".into())
+        std::fs::canonicalize("target/real-video-e2e/scene.mp4").map_or_else(
+            |_| "target/real-video-e2e/scene.mp4".into(),
+            |p| p.to_string_lossy().into_owned(),
+        )
     });
 
     let mut index = VisionIndex::new(media.clone());
@@ -59,6 +60,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 fn rect_slm1(box_xyxy: (f32, f32, f32, f32)) -> Vec<u8> {
     let (left, top, right, bottom) = box_xyxy;
     let l = left.max(0.0) as u32;

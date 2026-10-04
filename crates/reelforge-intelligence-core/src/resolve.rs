@@ -595,9 +595,11 @@ fn resolve_redact_pii(
         if !want.contains(&kind) {
             continue;
         }
-        if resolved.resolved_subjects.iter().any(|r| {
-            r.local_subject_id == Some(s.subject_id)
-        }) {
+        if resolved
+            .resolved_subjects
+            .iter()
+            .any(|r| r.local_subject_id == Some(s.subject_id))
+        {
             continue;
         }
         let rs = to_resolved(s, ts, index);
@@ -616,12 +618,7 @@ fn resolve_redact_pii(
     Ok(hits)
 }
 
-fn push_pii_object(
-    obj: &ObjectEvidence,
-    ts: u32,
-    index: &str,
-    resolved: &mut ResolvedEditPlan,
-) {
+fn push_pii_object(obj: &ObjectEvidence, ts: u32, index: &str, resolved: &mut ResolvedEditPlan) {
     let id = NamespacedId::sightloom_object(index, obj.object_id);
     let span = if obj.last_ticks > obj.first_ticks {
         Some(MediaRange::new(
@@ -629,9 +626,9 @@ fn push_pii_object(
             MediaTime::new(obj.last_ticks, ts),
         ))
     } else {
-        obj.samples.first().map(|s| {
-            MediaRange::new(MediaTime::new(s.ticks, ts), MediaTime::new(s.ticks, ts))
-        })
+        obj.samples
+            .first()
+            .map(|s| MediaRange::new(MediaTime::new(s.ticks, ts), MediaTime::new(s.ticks, ts)))
     };
     if let Some(span) = span {
         resolved.resolved_ranges.push(span);

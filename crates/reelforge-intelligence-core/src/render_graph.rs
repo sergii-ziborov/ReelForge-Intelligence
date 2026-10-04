@@ -170,9 +170,19 @@ pub struct ApprovalRecord {
 
 impl ApprovalRecord {
     /// True when execution is allowed.
+    ///
+    /// False when approval is required and not granted, or when
+    /// `expires_at_unix` is set and already in the past. A missing expiry
+    /// does not expire.
     #[must_use]
-    pub const fn allows_execute(&self) -> bool {
-        !self.required || self.approved
+    pub fn allows_execute(&self) -> bool {
+        !self.is_expired() && (!self.required || self.approved)
+    }
+
+    /// `expires_at_unix` is set and strictly before now.
+    #[must_use]
+    pub(crate) fn is_expired(&self) -> bool {
+        self.expires_at_unix.is_some_and(|t| t < now_unix())
     }
 }
 
@@ -446,9 +456,7 @@ fn map_edit_to_op(
     match edit {
         SemanticEdit::BlurSubject { .. }
         | SemanticEdit::BlurEveryoneExcept { .. }
-        | SemanticEdit::RedactPii { .. } => {
-            (op_id::REDACTION_REGION, redaction_params(resolved))
-        }
+        | SemanticEdit::RedactPii { .. } => (op_id::REDACTION_REGION, redaction_params(resolved)),
         SemanticEdit::FollowSubject { framing, .. } => {
             let mut params = serde_json::json!({
                 "framing": framing,
@@ -622,6 +630,12 @@ mod tests {
         assert!(!graph.approval.allows_execute());
         let approved = approve(graph.approval.clone(), "operator-1");
         assert!(approved.allows_execute());
+        let mut expired = approved.clone();
+        expired.expires_at_unix = Some(1);
+        assert!(!expired.allows_execute());
+        let mut future = approved.clone();
+        future.expires_at_unix = Some(i64::MAX);
+        assert!(future.allows_execute());
     }
 
     #[test]

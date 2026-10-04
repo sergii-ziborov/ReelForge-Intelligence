@@ -88,8 +88,9 @@ pub fn objects_from_index(
         let source_id = sample.source_id.0;
         let track_id = sample.track_id.0;
         let ticks = ticks_of(sample.pts, timescale);
-        let e = by_key.entry((source_id, track_id, kind)).or_insert_with(|| {
-            ObjectEvidence {
+        let e = by_key
+            .entry((source_id, track_id, kind))
+            .or_insert_with(|| ObjectEvidence {
                 object_id: u64::from(track_id)
                     .saturating_mul(4)
                     .saturating_add(pii_tag(kind)),
@@ -101,8 +102,7 @@ pub fn objects_from_index(
                 last_ticks: ticks,
                 samples: Vec::new(),
                 confidence: None,
-            }
-        });
+            });
         e.first_ticks = e.first_ticks.min(ticks);
         e.last_ticks = e.last_ticks.max(ticks);
         e.confidence = Some(e.confidence.unwrap_or(0.0).max(sample.confidence));
