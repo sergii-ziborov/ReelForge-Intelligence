@@ -24,11 +24,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sergii-ziborov/ReelForge
+          ref: 314107ccfe8b16bc3c85f1cc628822601f4f2bc8
           path: ReelForge
       - name: checkout SightLoom sibling
         uses: actions/checkout@v4
         with:
           repository: sergii-ziborov/SightLoom
+          ref: c6e726f38275490de31b5ba52cd80ee7d42a97df
           path: SightLoom
       - uses: dtolnay/rust-toolchain@stable
         with:
