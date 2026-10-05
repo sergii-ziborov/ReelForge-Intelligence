@@ -4,12 +4,14 @@
 //! without hard-linking the full `reelforge-render-graph` crate. Hosts can
 //! deserialize JSON into ReelForge types or map nodes explicitly.
 
-use crate::edit::SemanticEdit;
-use crate::ids::NamespacedId;
+use crate::edit::{FramingPolicy, SemanticEdit};
+use crate::framing::{self, CropRect};
+use crate::ids::{EntityKind, NamespacedId};
+use crate::mask::RegionSample;
 use crate::ops::edit_op_id;
 use crate::policy::{IntelligencePolicy, UncertaintyPolicy};
-use crate::resolved::ResolvedEditPlan;
-use crate::time::MediaRange;
+use crate::resolved::{ResolvedEditPlan, ResolvedMaskAsset, ResolvedOperation};
+use crate::time::{MediaRange, MediaTime};
 use serde::{Deserialize, Serialize};
 
 /// Schema version for Intelligence-produced graphs.
@@ -198,10 +200,16 @@ pub fn approval_for_resolved(
     {
         reasons.push("uncertain_identity=review".into());
     }
+    // The policy enum alone is not evidence. Review applies when resolve
+    // actually recorded a subject with no mask sample and no box.
     if matches!(
         policy.privacy.missing_mask,
         crate::policy::MissingMaskAction::Review
-    ) {
+    ) && resolved
+        .warnings
+        .iter()
+        .any(|warning| warning.message.to_lowercase().contains("missing mask"))
+    {
         reasons.push("missing_mask=review".into());
     }
     if resolved
@@ -343,7 +351,7 @@ pub fn graph_from_resolved(resolved: &ResolvedEditPlan) -> RenderGraphIr {
                 inputs: vec![prev.clone()],
                 asset: None,
                 name: None,
-                params: Some(redaction_params(resolved)),
+                params: Some(redaction_params(resolved, None)),
                 semantic: Some("blur".into()),
             });
             prev = id;
@@ -351,7 +359,7 @@ pub fn graph_from_resolved(resolved: &ResolvedEditPlan) -> RenderGraphIr {
     } else {
         for (i, edit) in intent_ops.iter().enumerate() {
             let id = format!("e{i}");
-            let (operation, params) = map_edit_to_op(edit, resolved);
+            let (operation, params) = map_edit_to_op(edit, resolved, i);
             nodes.push(GraphNode {
                 id: id.clone(),
                 kind: GraphNodeKind::Op,
@@ -452,99 +460,201 @@ pub fn graph_from_resolved(resolved: &ResolvedEditPlan) -> RenderGraphIr {
 fn map_edit_to_op(
     edit: &SemanticEdit,
     resolved: &ResolvedEditPlan,
+    edit_index: usize,
 ) -> (&'static str, serde_json::Value) {
     match edit {
         SemanticEdit::BlurSubject { .. }
         | SemanticEdit::BlurEveryoneExcept { .. }
-        | SemanticEdit::RedactPii { .. } => (op_id::REDACTION_REGION, redaction_params(resolved)),
+        | SemanticEdit::RedactPii { .. } => (
+            op_id::REDACTION_REGION,
+            redaction_params(resolved, Some(edit_index)),
+        ),
         SemanticEdit::FollowSubject { framing, .. } => {
+            let subjects = subject_uris(resolved, Some(edit_index));
+            let ranges = ranges_for(resolved, Some(edit_index));
             let mut params = serde_json::json!({
                 "framing": framing,
-                "subjects": resolved.resolved_subjects.iter().map(|s| s.id.as_uri()).collect::<Vec<_>>(),
-                "ranges": ranges_json(&resolved.resolved_ranges),
+                "subjects": subjects,
+                "ranges": ranges_json(&ranges),
             });
-            if let Some(crop) = follow_crop_params(resolved, *framing) {
-                if let Some(obj) = params.as_object_mut() {
-                    if let Some(c) = crop.as_object() {
-                        for (k, v) in c {
-                            obj.insert(k.clone(), v.clone());
-                        }
-                    }
+            if let Some(crop) = follow_crop_params(resolved, *framing, edit_index)
+                && let Some(obj) = params.as_object_mut()
+                && let Some(crop_obj) = crop.as_object()
+            {
+                for (key, value) in crop_obj {
+                    obj.insert(key.clone(), value.clone());
                 }
             }
             (op_id::TRANSFORM_CROP, params)
         }
         SemanticEdit::BuildSubjectReel { .. }
-        | SemanticEdit::BuildMostFrequentSubjectReel { .. } => (
-            op_id::TIMELINE_CONCAT,
-            serde_json::json!({
-                "subjects": resolved.resolved_subjects.iter().map(|s| s.id.as_uri()).collect::<Vec<_>>(),
-                "ranges": ranges_json(&resolved.resolved_ranges),
-                "mode": "subject_reel",
-            }),
-        ),
-        SemanticEdit::BuildAnomalyReel { .. } | SemanticEdit::CreateEventClips { .. } => (
-            op_id::TIMELINE_CONCAT,
-            serde_json::json!({
-                "events": resolved.resolved_events.len(),
-                "ranges": ranges_json(&resolved.resolved_ranges),
-                "mode": "event_reel",
-            }),
-        ),
+        | SemanticEdit::BuildMostFrequentSubjectReel { .. } => {
+            let subjects = subject_uris(resolved, Some(edit_index));
+            let ranges = ranges_for(resolved, Some(edit_index));
+            (
+                op_id::TIMELINE_CONCAT,
+                serde_json::json!({
+                    "subjects": subjects,
+                    "ranges": ranges_json(&ranges),
+                    "mode": "subject_reel",
+                }),
+            )
+        }
+        SemanticEdit::BuildAnomalyReel { .. } | SemanticEdit::CreateEventClips { .. } => {
+            let events = operation_at(resolved, edit_index)
+                .map_or(resolved.resolved_events.len(), |operation| {
+                    operation.ranges.len()
+                });
+            let ranges = ranges_for(resolved, Some(edit_index));
+            (
+                op_id::TIMELINE_CONCAT,
+                serde_json::json!({
+                    "events": events,
+                    "ranges": ranges_json(&ranges),
+                    "mode": "event_reel",
+                }),
+            )
+        }
     }
 }
 
-fn redaction_params(resolved: &ResolvedEditPlan) -> serde_json::Value {
+/// Per-edit record. `None` means a plan frozen before operation scope existed.
+fn operation_at(resolved: &ResolvedEditPlan, edit_index: usize) -> Option<&ResolvedOperation> {
+    resolved
+        .operations
+        .iter()
+        .find(|operation| operation.edit_index == edit_index)
+}
+
+/// Subjects this edit may change. An existing record wins even when it is empty.
+fn subject_uris(resolved: &ResolvedEditPlan, edit_index: Option<usize>) -> Vec<String> {
+    if let Some(edit_index) = edit_index
+        && let Some(operation) = operation_at(resolved, edit_index)
+    {
+        return operation.subjects.clone();
+    }
+    resolved
+        .resolved_subjects
+        .iter()
+        .map(|subject| subject.id.as_uri())
+        .collect()
+}
+
+/// Ranges this edit may change. An existing record wins even when it is empty.
+fn ranges_for(resolved: &ResolvedEditPlan, edit_index: Option<usize>) -> Vec<MediaRange> {
+    if let Some(edit_index) = edit_index
+        && let Some(operation) = operation_at(resolved, edit_index)
+    {
+        return operation.ranges.clone();
+    }
+    resolved.resolved_ranges.clone()
+}
+
+fn id_in_operation(operation: &ResolvedOperation, subject: &NamespacedId) -> bool {
+    let uri = subject.as_uri();
+    operation.subjects.contains(&uri)
+        || (subject.kind == EntityKind::Subject
+            && operation.local_subject_ids.contains(&subject.id))
+}
+
+fn mask_in_operation(mask: &ResolvedMaskAsset, operation: &ResolvedOperation) -> bool {
+    mask.subject
+        .as_ref()
+        .is_some_and(|subject| id_in_operation(operation, subject))
+}
+
+fn mask_count(resolved: &ResolvedEditPlan, edit_index: Option<usize>) -> usize {
+    let Some(edit_index) = edit_index else {
+        return resolved.resolved_masks.len();
+    };
+    let Some(operation) = operation_at(resolved, edit_index) else {
+        return resolved.resolved_masks.len();
+    };
+    resolved
+        .resolved_masks
+        .iter()
+        .filter(|mask| mask_in_operation(mask, operation))
+        .count()
+}
+
+fn redaction_params(resolved: &ResolvedEditPlan, edit_index: Option<usize>) -> serde_json::Value {
+    let subjects = subject_uris(resolved, edit_index);
+    let ranges = ranges_for(resolved, edit_index);
     serde_json::json!({
         "style": "blur",
-        "subjects": resolved.resolved_subjects.iter().map(|s| s.id.as_uri()).collect::<Vec<_>>(),
-        "ranges": ranges_json(&resolved.resolved_ranges),
-        "masks": resolved.resolved_masks.len(),
+        "subjects": subjects,
+        "ranges": ranges_json(&ranges),
+        "masks": mask_count(resolved, edit_index),
         "privacy": resolved.policy.privacy,
     })
 }
 
 fn follow_crop_params(
     resolved: &ResolvedEditPlan,
-    framing: crate::edit::FramingPolicy,
+    framing: FramingPolicy,
+    edit_index: usize,
 ) -> Option<serde_json::Value> {
-    let w = resolved.frame_width?;
-    let h = resolved.frame_height?;
-    let frame = crate::framing::FrameSize::new(w, h)?;
-    let mut boxes: Vec<crate::mask::RegionSample> = resolved
-        .resolved_masks
-        .iter()
-        .filter_map(|m| m.artifact.as_ref())
-        .flat_map(|a| a.regions.clone())
-        .collect();
-    if boxes.is_empty() {
-        let ts = resolved
-            .resolved_ranges
-            .first()
-            .map_or(1_000_000_000, |r| r.start.timescale);
-        boxes = resolved
-            .subject_boxes
-            .iter()
-            .map(|(_, xyxy)| crate::mask::RegionSample {
-                at: crate::time::MediaTime::new(0, ts.max(1)),
-                box_xyxy: *xyxy,
-                subject: None,
-                confidence: None,
-                geometry: None,
-            })
-            .collect();
-    }
+    let width = resolved.frame_width?;
+    let height = resolved.frame_height?;
+    let frame = framing::FrameSize::new(width, height)?;
+    let boxes = scoped_region_boxes(resolved, edit_index);
     if boxes.is_empty() {
         return None;
     }
-    crate::framing::compute_follow_crop(
-        &boxes,
-        framing,
-        frame,
-        crate::framing::FramingOptions::default(),
-    )
-    .ok()
-    .map(crate::framing::CropRect::to_params)
+    framing::compute_follow_crop(&boxes, framing, frame, framing::FramingOptions::default())
+        .ok()
+        .map(CropRect::to_params)
+}
+
+/// Mask samples and snapshot boxes that belong to this edit.
+///
+/// A plan with no operation record keeps every box. A record that names no
+/// subject yields no boxes, so another edit's geometry cannot move the crop.
+fn scoped_region_boxes(resolved: &ResolvedEditPlan, edit_index: usize) -> Vec<RegionSample> {
+    let operation = operation_at(resolved, edit_index);
+    let mut boxes = Vec::new();
+    for mask in &resolved.resolved_masks {
+        if let Some(operation) = operation
+            && !mask_in_operation(mask, operation)
+        {
+            continue;
+        }
+        let Some(artifact) = mask.artifact.as_ref() else {
+            continue;
+        };
+        for region in &artifact.regions {
+            if let Some(operation) = operation
+                && let Some(subject) = region.subject.as_ref()
+                && !id_in_operation(operation, subject)
+            {
+                continue;
+            }
+            boxes.push(region.clone());
+        }
+    }
+    if !boxes.is_empty() {
+        return boxes;
+    }
+    let scoped = ranges_for(resolved, Some(edit_index));
+    let timescale = scoped
+        .first()
+        .or(resolved.resolved_ranges.first())
+        .map_or(1_000_000_000, |range| range.start.timescale);
+    resolved
+        .subject_boxes
+        .iter()
+        .filter(|(id, _)| match operation {
+            Some(operation) => operation.local_subject_ids.contains(id),
+            None => true,
+        })
+        .map(|(_, xyxy)| RegionSample {
+            at: MediaTime::new(0, timescale.max(1)),
+            box_xyxy: *xyxy,
+            subject: None,
+            confidence: None,
+            geometry: None,
+        })
+        .collect()
 }
 
 fn ranges_json(ranges: &[MediaRange]) -> Vec<serde_json::Value> {
@@ -660,5 +770,212 @@ mod tests {
         assert!(crop.get("h").and_then(serde_json::Value::as_u64).unwrap() >= 100);
         assert!(crop.get("x").is_some());
         assert!(crop.get("y").is_some());
+    }
+
+    fn two_photos() -> AnalysisSnapshot {
+        AnalysisSnapshot {
+            media: "cam1".into(),
+            source_hash: "src".into(),
+            vision_index_generation: "gen-1".into(),
+            vision_index_hash: "idx".into(),
+            timescale: 1_000_000_000,
+            frame_width: Some(1920),
+            frame_height: Some(1080),
+            subjects: vec![
+                SubjectEvidence {
+                    subject_id: 1,
+                    label: Some("near-origin".into()),
+                    appearance_count: 1,
+                    source_ids: vec![1],
+                    confidence: Some(0.95),
+                    ..SubjectEvidence::default()
+                }
+                .with_visit(0, 1_000_000_000),
+                SubjectEvidence {
+                    subject_id: 2,
+                    label: Some("right-side".into()),
+                    appearance_count: 1,
+                    source_ids: vec![2],
+                    confidence: Some(0.95),
+                    ..SubjectEvidence::default()
+                }
+                .with_visit(2_000_000_000, 3_000_000_000),
+            ],
+            subject_boxes: vec![
+                (1, [8.0, 8.0, 32.0, 40.0]),
+                (2, [400.0, 180.0, 520.0, 420.0]),
+            ],
+            ..AnalysisSnapshot::default()
+        }
+    }
+
+    fn blur_and_follow() -> SemanticEditPlan {
+        SemanticEditPlan::new("cam1")
+            .with_edit(SemanticEdit::BlurSubject {
+                subject: crate::selector::SubjectSelector::SubjectIds { ids: vec![1] },
+            })
+            .with_edit(SemanticEdit::FollowSubject {
+                subject: crate::selector::SubjectSelector::SubjectIds { ids: vec![2] },
+                framing: FramingPolicy::Tight,
+            })
+    }
+
+    fn node_params<'a>(graph: &'a RenderGraphIr, operation: &str) -> &'a serde_json::Value {
+        graph
+            .nodes
+            .iter()
+            .find(|node| node.operation.as_deref() == Some(operation))
+            .and_then(|node| node.params.as_ref())
+            .unwrap_or_else(|| panic!("missing {operation}"))
+    }
+
+    fn string_list(value: &serde_json::Value, key: &str) -> Vec<String> {
+        value[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing {key}"))
+            .iter()
+            .map(|item| item.as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn range_ticks(value: &serde_json::Value) -> Vec<(i64, i64)> {
+        value["ranges"]
+            .as_array()
+            .expect("ranges")
+            .iter()
+            .map(|range| {
+                (
+                    range["start"]["ticks"].as_i64().unwrap_or_default(),
+                    range["end"]["ticks"].as_i64().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn blur_of_one_subject_does_not_receive_the_follow_target() {
+        let resolved = resolve_plan(
+            &blur_and_follow(),
+            &two_photos(),
+            IntelligencePolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved
+                .resolved_subjects
+                .iter()
+                .find(|subject| subject.local_subject_id == Some(1))
+                .unwrap()
+                .source_ids,
+            vec![1]
+        );
+        assert_eq!(
+            resolved
+                .resolved_subjects
+                .iter()
+                .find(|subject| subject.local_subject_id == Some(2))
+                .unwrap()
+                .source_ids,
+            vec![2]
+        );
+        let graph = graph_from_resolved(&resolved);
+        let blur = node_params(&graph, op_id::REDACTION_REGION);
+        let follow = node_params(&graph, op_id::TRANSFORM_CROP);
+        let adapter = node_params(&graph, op_id::ADAPTER_SIGHTLOOM);
+        assert_eq!(
+            string_list(blur, "subjects"),
+            vec!["sightloom://gen-1/subjects/1".to_string()]
+        );
+        assert_eq!(range_ticks(blur), vec![(0, 1_000_000_000)]);
+        assert_eq!(
+            string_list(follow, "subjects"),
+            vec!["sightloom://gen-1/subjects/2".to_string()]
+        );
+        assert_eq!(range_ticks(follow), vec![(2_000_000_000, 3_000_000_000)]);
+        let crop_x = follow["x"].as_u64().expect("scoped crop x");
+        assert!(
+            crop_x >= 200,
+            "follow crop must sit on subject 2, x={crop_x}"
+        );
+        assert_eq!(string_list(adapter, "subjects").len(), 2);
+        assert_eq!(range_ticks(adapter).len(), 2);
+
+        let mut legacy_json = serde_json::to_value(&resolved).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("operations");
+        let legacy: ResolvedEditPlan = serde_json::from_value(legacy_json).unwrap();
+        assert!(legacy.operations.is_empty());
+        let legacy_graph = graph_from_resolved(&legacy);
+        let legacy_blur = node_params(&legacy_graph, op_id::REDACTION_REGION);
+        let legacy_follow = node_params(&legacy_graph, op_id::TRANSFORM_CROP);
+        assert_eq!(string_list(legacy_blur, "subjects").len(), 2);
+        assert_eq!(range_ticks(legacy_follow).len(), 2);
+        let legacy_x = legacy_follow["x"].as_u64().expect("legacy crop x");
+        assert!(
+            legacy_x < crop_x,
+            "union crop x={legacy_x} must stay left of the scoped crop x={crop_x}"
+        );
+    }
+
+    #[test]
+    fn skipped_subject_stays_off_the_redaction_node() {
+        let mut policy = IntelligencePolicy::default();
+        policy.privacy.missing_mask = crate::policy::MissingMaskAction::Skip;
+        let mut analysis = two_photos();
+        analysis.subject_boxes.clear();
+        analysis.subjects.retain(|subject| subject.subject_id == 1);
+        let intent = SemanticEditPlan::new("cam1").with_edit(SemanticEdit::BlurSubject {
+            subject: crate::selector::SubjectSelector::SubjectIds { ids: vec![1] },
+        });
+        let resolved = resolve_plan(&intent, &analysis, policy).unwrap();
+        assert!(
+            resolved
+                .decisions
+                .iter()
+                .any(|decision| decision.code == "missing_mask_skip")
+        );
+        assert!(resolved.operations[0].subjects.is_empty());
+        assert_eq!(resolved.resolved_subjects.len(), 1);
+        let graph = graph_from_resolved(&resolved);
+        let blur = node_params(&graph, op_id::REDACTION_REGION);
+        assert!(string_list(blur, "subjects").is_empty());
+        let adapter = node_params(&graph, op_id::ADAPTER_SIGHTLOOM);
+        assert_eq!(
+            string_list(adapter, "subjects"),
+            vec!["sightloom://gen-1/subjects/1".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_mask_review_requires_approval_only_without_evidence() {
+        let mut policy = IntelligencePolicy::default();
+        policy.privacy.missing_mask = crate::policy::MissingMaskAction::Review;
+        policy.require_approve_on_review = true;
+        let intent = SemanticEditPlan::new("cam1").with_edit(SemanticEdit::BlurSubject {
+            subject: crate::selector::SubjectSelector::SubjectIds { ids: vec![1] },
+        });
+        let mut bare = two_photos();
+        bare.subject_boxes.clear();
+        bare.subjects.retain(|subject| subject.subject_id == 1);
+        let missing = resolve_plan(&intent, &bare, policy.clone()).unwrap();
+        let approval = approval_for_resolved(&missing, &missing.policy);
+        assert!(approval.required);
+        assert!(
+            approval
+                .reasons
+                .iter()
+                .any(|reason| reason == "missing_mask=review")
+        );
+
+        let mut with_box = bare;
+        with_box.subject_boxes = vec![(1, [10.0, 10.0, 40.0, 40.0])];
+        let present = resolve_plan(&intent, &with_box, policy).unwrap();
+        let approval = approval_for_resolved(&present, &present.policy);
+        assert!(!approval.required);
+        assert!(
+            !approval
+                .reasons
+                .iter()
+                .any(|reason| reason == "missing_mask=review")
+        );
     }
 }

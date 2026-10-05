@@ -87,6 +87,22 @@ pub struct ResolvedMaskAsset {
     pub artifact: Option<MaskArtifact>,
 }
 
+/// Targets that belong to one semantic edit, not the whole plan.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedOperation {
+    /// Index into the intent plan's `edits`.
+    pub edit_index: usize,
+    /// Namespaced subject URIs this edit may change.
+    #[serde(default)]
+    pub subjects: Vec<String>,
+    /// Local subject ids, used to keep boxes with the same edit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_subject_ids: Vec<u64>,
+    /// Time ranges this edit may change.
+    #[serde(default)]
+    pub ranges: Vec<MediaRange>,
+}
+
 /// Why a subject/event was chosen or rejected.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolutionDecision {
@@ -134,8 +150,13 @@ pub struct ResolvedEditPlan {
     #[serde(default)]
     pub resolved_masks: Vec<ResolvedMaskAsset>,
     /// Time ranges for reels / redactions / follows.
+    ///
+    /// This is the union. Each edit's own targets live in [`Self::operations`].
     #[serde(default)]
     pub resolved_ranges: Vec<MediaRange>,
+    /// Per-edit targets. Empty on plans frozen before operation scope existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<ResolvedOperation>,
     /// Decisions audit trail.
     #[serde(default)]
     pub decisions: Vec<ResolutionDecision>,
@@ -187,6 +208,7 @@ impl ResolvedEditPlan {
             resolved_events: Vec::new(),
             resolved_masks: Vec::new(),
             resolved_ranges: Vec::new(),
+            operations: Vec::new(),
             decisions: Vec::new(),
             warnings: Vec::new(),
             policy: IntelligencePolicy::default(),

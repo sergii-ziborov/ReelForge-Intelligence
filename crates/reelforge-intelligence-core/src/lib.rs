@@ -111,7 +111,7 @@ pub use resolve::{
 };
 pub use resolved::{
     RESOLVED_EDIT_PLAN_VERSION, ResolutionDecision, ResolutionWarning, ResolvedEditPlan,
-    ResolvedEvent, ResolvedMaskAsset, ResolvedSubject, whole_media_range,
+    ResolvedEvent, ResolvedMaskAsset, ResolvedOperation, ResolvedSubject, whole_media_range,
 };
 pub use rewrite::{SelectorBinding, bindings_from_value, rewrite_selectors};
 pub use selector::SubjectSelector;

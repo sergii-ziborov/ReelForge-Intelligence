@@ -5,11 +5,11 @@ use crate::error::{IntelError, Result};
 use crate::ids::NamespacedId;
 use crate::mask::{MaskArtifact, MaskFidelity, RegionSample};
 use crate::pii::PiiKind;
-use crate::policy::IntelligencePolicy;
+use crate::policy::{IntelligencePolicy, MissingMaskAction};
 use crate::query::EventQuery;
 use crate::resolved::{
     ResolutionDecision, ResolutionWarning, ResolvedEditPlan, ResolvedEvent, ResolvedMaskAsset,
-    ResolvedSubject,
+    ResolvedOperation, ResolvedSubject,
 };
 use crate::selector::SubjectSelector;
 use crate::time::{MediaRange, MediaTime};
@@ -376,7 +376,10 @@ pub fn resolve_plan(
                 framing: _,
             } => {
                 let subjects = select_subjects(subject, analysis, edit_index, &mut resolved)?;
-                push_subject_coverage(&subjects, &mut resolved);
+                let kept = apply_missing_mask(&subjects, analysis, edit_index, &mut resolved)?;
+                let ranges = coverage_ranges(&kept);
+                resolved.resolved_ranges.extend(ranges.iter().copied());
+                remember_operation(&mut resolved, edit_index, &kept, &ranges);
             }
             SemanticEdit::BuildSubjectReel {
                 subject,
@@ -384,8 +387,11 @@ pub fn resolve_plan(
                 post_roll,
             } => {
                 needs_ranges = true;
+                let range_mark = resolved.resolved_ranges.len();
                 let subjects = select_subjects(subject, analysis, edit_index, &mut resolved)?;
                 let n = push_reel_ranges(&subjects, *pre_roll, *post_roll, &mut resolved);
+                let ranges = resolved.resolved_ranges[range_mark..].to_vec();
+                remember_operation(&mut resolved, edit_index, &subjects, &ranges);
                 resolved.decisions.push(ResolutionDecision {
                     code: "subject_reel".into(),
                     message: format!("{n} appearance ranges with pre/post-roll"),
@@ -427,6 +433,16 @@ pub fn resolve_plan(
                     ),
                     edit_index: Some(edit_index),
                 });
+                let blurred: Vec<ResolvedSubject> = analysis
+                    .subjects
+                    .iter()
+                    .filter(|s| !allowed_set.contains(&s.subject_id))
+                    .map(|s| to_resolved(s, ts, index_key(analysis)))
+                    .collect();
+                let kept = apply_missing_mask(&blurred, analysis, edit_index, &mut resolved)?;
+                let ranges = coverage_ranges(&kept);
+                resolved.resolved_ranges.extend(ranges.iter().copied());
+                remember_operation(&mut resolved, edit_index, &kept, &ranges);
             }
             SemanticEdit::BuildMostFrequentSubjectReel { metric } => {
                 needs_ranges = true;
@@ -438,8 +454,9 @@ pub fn resolve_plan(
                 let index = index_key(analysis);
                 let rs = to_resolved(best, ts, index);
                 resolved.resolved_subjects.push(rs.clone());
+                let range_mark = resolved.resolved_ranges.len();
                 let n = push_reel_ranges(
-                    &[rs],
+                    std::slice::from_ref(&rs),
                     MediaTime::default(),
                     MediaTime::default(),
                     &mut resolved,
@@ -459,6 +476,13 @@ pub fn resolve_plan(
                         "resolve: most-frequent subject has no discrete appearances",
                     ));
                 }
+                let ranges = resolved.resolved_ranges[range_mark..].to_vec();
+                remember_operation(
+                    &mut resolved,
+                    edit_index,
+                    std::slice::from_ref(&rs),
+                    &ranges,
+                );
             }
             SemanticEdit::BuildAnomalyReel { query } => {
                 needs_ranges = true;
@@ -473,6 +497,7 @@ pub fn resolve_plan(
                     ));
                 }
                 let index = index_key(analysis);
+                let range_mark = resolved.resolved_ranges.len();
                 for a in hits {
                     let range = MediaRange::new(
                         MediaTime::new(a.start_ticks, ts),
@@ -493,6 +518,8 @@ pub fn resolve_plan(
                     message: format!("{} anomaly ranges frozen", resolved.resolved_events.len()),
                     edit_index: Some(edit_index),
                 });
+                let ranges = resolved.resolved_ranges[range_mark..].to_vec();
+                remember_operation(&mut resolved, edit_index, &[], &ranges);
             }
             SemanticEdit::CreateEventClips {
                 query,
@@ -511,6 +538,7 @@ pub fn resolve_plan(
                     ));
                 }
                 let index = index_key(analysis);
+                let range_mark = resolved.resolved_ranges.len();
                 let pre = MediaTime::from_secs_f64(*pad_before_secs, ts);
                 let post = MediaTime::from_secs_f64(*pad_after_secs, ts);
                 for ev in hits {
@@ -537,15 +565,22 @@ pub fn resolve_plan(
                     ),
                     edit_index: Some(edit_index),
                 });
+                let ranges = resolved.resolved_ranges[range_mark..].to_vec();
+                remember_operation(&mut resolved, edit_index, &[], &ranges);
             }
             SemanticEdit::RedactPii { kinds } => {
                 let want = requested_pii_kinds(kinds);
+                let subject_mark = resolved.resolved_subjects.len();
+                let range_mark = resolved.resolved_ranges.len();
                 let n = resolve_redact_pii(analysis, &want, ts, &mut resolved)?;
                 resolved.decisions.push(ResolutionDecision {
                     code: "redact_pii".into(),
                     message: format!("redact {n} PII objects ({want:?})"),
                     edit_index: Some(edit_index),
                 });
+                let subjects = resolved.resolved_subjects[subject_mark..].to_vec();
+                let ranges = resolved.resolved_ranges[range_mark..].to_vec();
+                remember_operation(&mut resolved, edit_index, &subjects, &ranges);
             }
         }
     }
@@ -703,6 +738,95 @@ fn to_resolved(s: &SubjectEvidence, ts: u32, index_id: &str) -> ResolvedSubject 
         visible_duration_ticks: s.visible_duration_ticks(),
         confidence: s.confidence,
     }
+}
+
+fn coverage_ranges(subjects: &[ResolvedSubject]) -> Vec<MediaRange> {
+    let mut ranges = Vec::new();
+    for subject in subjects {
+        if subject.appearances.is_empty() {
+            if let Some(span) = subject.span {
+                ranges.push(span);
+            }
+        } else {
+            ranges.extend(subject.appearances.iter().copied());
+        }
+    }
+    ranges
+}
+
+fn remember_operation(
+    resolved: &mut ResolvedEditPlan,
+    edit_index: usize,
+    subjects: &[ResolvedSubject],
+    ranges: &[MediaRange],
+) {
+    resolved.operations.push(ResolvedOperation {
+        edit_index,
+        subjects: subjects.iter().map(|s| s.id.as_uri()).collect(),
+        local_subject_ids: subjects.iter().filter_map(|s| s.local_subject_id).collect(),
+        ranges: ranges.to_vec(),
+    });
+}
+
+fn subject_has_mask(analysis: &AnalysisSnapshot, subject_id: u64) -> bool {
+    analysis
+        .mask_samples
+        .iter()
+        .any(|sample| sample.subject_id == subject_id)
+        || analysis
+            .subject_boxes
+            .iter()
+            .any(|(id, _)| *id == subject_id)
+}
+
+/// Keep, drop, or reject subjects that have no mask sample and no box.
+fn apply_missing_mask(
+    subjects: &[ResolvedSubject],
+    analysis: &AnalysisSnapshot,
+    edit_index: usize,
+    resolved: &mut ResolvedEditPlan,
+) -> Result<Vec<ResolvedSubject>> {
+    let mut kept = Vec::new();
+    for subject in subjects {
+        let has_mask = subject
+            .local_subject_id
+            .is_some_and(|id| subject_has_mask(analysis, id));
+        if has_mask {
+            kept.push(subject.clone());
+            continue;
+        }
+        match resolved.policy.privacy.missing_mask {
+            MissingMaskAction::Fail => {
+                return Err(IntelError::message(format!(
+                    "resolve: missing mask for {} (missing_mask=fail)",
+                    subject.id.as_uri()
+                )));
+            }
+            MissingMaskAction::Skip => {
+                resolved.decisions.push(ResolutionDecision {
+                    code: "missing_mask_skip".into(),
+                    message: format!("skip {} with no mask evidence", subject.id.as_uri()),
+                    edit_index: Some(edit_index),
+                });
+            }
+            MissingMaskAction::Review => {
+                resolved.warnings.push(ResolutionWarning {
+                    message: format!("missing mask for {} — review required", subject.id.as_uri()),
+                    edit_index: Some(edit_index),
+                });
+                kept.push(subject.clone());
+            }
+            MissingMaskAction::ConservativeHold | MissingMaskAction::DilateLast => {
+                resolved.decisions.push(ResolutionDecision {
+                    code: "missing_mask_hold".into(),
+                    message: format!("hold {} without a mask sample", subject.id.as_uri()),
+                    edit_index: Some(edit_index),
+                });
+                kept.push(subject.clone());
+            }
+        }
+    }
+    Ok(kept)
 }
 
 /// Coverage ranges for blur/follow: discrete appearances, else nothing (no invented span).
@@ -1348,5 +1472,88 @@ mod tests {
                 .iter()
                 .any(|s| s.local_subject_id == Some(77))
         );
+    }
+
+    fn lone_subject(id: u64, source: u32) -> AnalysisSnapshot {
+        AnalysisSnapshot {
+            media: "cam1".into(),
+            source_hash: "src".into(),
+            vision_index_generation: "gen-1".into(),
+            vision_index_hash: "idx".into(),
+            timescale: 1_000_000_000,
+            subjects: vec![subject_row(
+                id,
+                "person",
+                1,
+                vec![source],
+                0,
+                1_000_000_000,
+                0.95,
+                &[(0, 1_000_000_000)],
+            )],
+            ..AnalysisSnapshot::default()
+        }
+    }
+
+    fn blur_one(id: u64) -> SemanticEditPlan {
+        SemanticEditPlan::new("cam1").with_edit(SemanticEdit::BlurSubject {
+            subject: SubjectSelector::SubjectIds { ids: vec![id] },
+        })
+    }
+
+    #[test]
+    fn missing_mask_fail_rejects_blur_and_follow() {
+        let mut policy = IntelligencePolicy::default();
+        policy.privacy.missing_mask = MissingMaskAction::Fail;
+        let err = resolve_plan(&blur_one(1), &lone_subject(1, 1), policy.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing_mask=fail"), "{err}");
+        let follow = SemanticEditPlan::new("cam1").with_edit(SemanticEdit::FollowSubject {
+            subject: SubjectSelector::SubjectIds { ids: vec![1] },
+            framing: crate::edit::FramingPolicy::Tight,
+        });
+        let err = resolve_plan(&follow, &lone_subject(1, 1), policy)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing_mask=fail"), "{err}");
+    }
+
+    #[test]
+    fn missing_mask_skip_omits_the_subject_from_the_operation() {
+        let mut policy = IntelligencePolicy::default();
+        policy.privacy.missing_mask = MissingMaskAction::Skip;
+        let resolved = resolve_plan(&blur_one(1), &lone_subject(1, 1), policy).unwrap();
+        assert!(
+            resolved
+                .decisions
+                .iter()
+                .any(|decision| decision.code == "missing_mask_skip")
+        );
+        assert!(resolved.operations[0].subjects.is_empty());
+        assert!(resolved.operations[0].local_subject_ids.is_empty());
+        assert_eq!(resolved.resolved_subjects.len(), 1);
+    }
+
+    #[test]
+    fn missing_mask_hold_keeps_the_subject() {
+        let resolved = resolve_plan(
+            &blur_one(1),
+            &lone_subject(1, 1),
+            IntelligencePolicy::default(),
+        )
+        .unwrap();
+        assert!(
+            resolved
+                .decisions
+                .iter()
+                .any(|decision| decision.code == "missing_mask_hold")
+        );
+        assert_eq!(
+            resolved.operations[0].subjects,
+            vec!["sightloom://gen-1/subjects/1".to_string()]
+        );
+        assert_eq!(resolved.operations[0].ranges[0].start.ticks, 0);
+        assert_eq!(resolved.operations[0].ranges[0].end.ticks, 1_000_000_000);
     }
 }
