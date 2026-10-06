@@ -110,8 +110,9 @@ pub use resolve::{
     ObjectEvidence, ObjectSample, SubjectEvidence, TrackBinding, resolve_plan,
 };
 pub use resolved::{
-    RESOLVED_EDIT_PLAN_VERSION, ResolutionDecision, ResolutionWarning, ResolvedEditPlan,
-    ResolvedEvent, ResolvedMaskAsset, ResolvedOperation, ResolvedSubject, whole_media_range,
+    PolicyDisposition, RESOLVED_EDIT_PLAN_VERSION, ResolutionDecision, ResolutionWarning,
+    ResolvedEditPlan, ResolvedEvent, ResolvedMaskAsset, ResolvedOperation, ResolvedSubject,
+    whole_media_range,
 };
 pub use rewrite::{SelectorBinding, bindings_from_value, rewrite_selectors};
 pub use selector::SubjectSelector;

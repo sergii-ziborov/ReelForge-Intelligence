@@ -8,8 +8,8 @@ use crate::pii::PiiKind;
 use crate::policy::{IntelligencePolicy, MissingMaskAction};
 use crate::query::EventQuery;
 use crate::resolved::{
-    ResolutionDecision, ResolutionWarning, ResolvedEditPlan, ResolvedEvent, ResolvedMaskAsset,
-    ResolvedOperation, ResolvedSubject,
+    PolicyDisposition, ResolutionDecision, ResolutionWarning, ResolvedEditPlan, ResolvedEvent,
+    ResolvedMaskAsset, ResolvedOperation, ResolvedSubject,
 };
 use crate::selector::SubjectSelector;
 use crate::time::{MediaRange, MediaTime};
@@ -396,6 +396,7 @@ pub fn resolve_plan(
                     code: "subject_reel".into(),
                     message: format!("{n} appearance ranges with pre/post-roll"),
                     edit_index: Some(edit_index),
+                    disposition: PolicyDisposition::Noted,
                 });
                 if n == 0 {
                     return Err(IntelError::message(format!(
@@ -432,6 +433,7 @@ pub fn resolve_plan(
                         allowed_set.len()
                     ),
                     edit_index: Some(edit_index),
+                    disposition: PolicyDisposition::Noted,
                 });
                 let blurred: Vec<ResolvedSubject> = analysis
                     .subjects
@@ -470,6 +472,7 @@ pub fn resolve_plan(
                         best.visible_duration_ticks()
                     ),
                     edit_index: Some(edit_index),
+                    disposition: PolicyDisposition::Noted,
                 });
                 if n == 0 {
                     return Err(IntelError::message(
@@ -517,6 +520,7 @@ pub fn resolve_plan(
                     code: "anomaly_reel".into(),
                     message: format!("{} anomaly ranges frozen", resolved.resolved_events.len()),
                     edit_index: Some(edit_index),
+                    disposition: PolicyDisposition::Noted,
                 });
                 let ranges = resolved.resolved_ranges[range_mark..].to_vec();
                 remember_operation(&mut resolved, edit_index, &[], &ranges);
@@ -564,6 +568,7 @@ pub fn resolve_plan(
                         resolved.resolved_events.len()
                     ),
                     edit_index: Some(edit_index),
+                    disposition: PolicyDisposition::Noted,
                 });
                 let ranges = resolved.resolved_ranges[range_mark..].to_vec();
                 remember_operation(&mut resolved, edit_index, &[], &ranges);
@@ -577,6 +582,7 @@ pub fn resolve_plan(
                     code: "redact_pii".into(),
                     message: format!("redact {n} PII objects ({want:?})"),
                     edit_index: Some(edit_index),
+                    disposition: PolicyDisposition::Noted,
                 });
                 let subjects = resolved.resolved_subjects[subject_mark..].to_vec();
                 let ranges = resolved.resolved_ranges[range_mark..].to_vec();
@@ -807,20 +813,35 @@ fn apply_missing_mask(
                     code: "missing_mask_skip".into(),
                     message: format!("skip {} with no mask evidence", subject.id.as_uri()),
                     edit_index: Some(edit_index),
+                    disposition: PolicyDisposition::Skip,
                 });
             }
             MissingMaskAction::Review => {
+                let uri = subject.id.as_uri();
+                resolved.decisions.push(ResolutionDecision {
+                    code: "missing_mask_review".into(),
+                    message: format!("missing mask for {uri} — review required"),
+                    edit_index: Some(edit_index),
+                    disposition: PolicyDisposition::Review,
+                });
                 resolved.warnings.push(ResolutionWarning {
-                    message: format!("missing mask for {} — review required", subject.id.as_uri()),
+                    message: format!("missing mask for {uri} — review required"),
                     edit_index: Some(edit_index),
                 });
                 kept.push(subject.clone());
             }
             MissingMaskAction::ConservativeHold | MissingMaskAction::DilateLast => {
+                let code = if resolved.policy.privacy.missing_mask == MissingMaskAction::DilateLast
+                {
+                    "missing_mask_dilate"
+                } else {
+                    "missing_mask_hold"
+                };
                 resolved.decisions.push(ResolutionDecision {
-                    code: "missing_mask_hold".into(),
+                    code: code.into(),
                     message: format!("hold {} without a mask sample", subject.id.as_uri()),
                     edit_index: Some(edit_index),
+                    disposition: PolicyDisposition::Hold,
                 });
                 kept.push(subject.clone());
             }
@@ -1057,6 +1078,7 @@ fn select_subjects(
         code: "select_subjects".into(),
         message: format!("selected {} subjects", list.len()),
         edit_index: Some(edit_index),
+        disposition: PolicyDisposition::Noted,
     });
     Ok(list)
 }
@@ -1524,12 +1546,9 @@ mod tests {
         let mut policy = IntelligencePolicy::default();
         policy.privacy.missing_mask = MissingMaskAction::Skip;
         let resolved = resolve_plan(&blur_one(1), &lone_subject(1, 1), policy).unwrap();
-        assert!(
-            resolved
-                .decisions
-                .iter()
-                .any(|decision| decision.code == "missing_mask_skip")
-        );
+        assert!(resolved.decisions.iter().any(|decision| {
+            decision.code == "missing_mask_skip" && decision.disposition == PolicyDisposition::Skip
+        }));
         assert!(resolved.operations[0].subjects.is_empty());
         assert!(resolved.operations[0].local_subject_ids.is_empty());
         assert_eq!(resolved.resolved_subjects.len(), 1);
@@ -1543,17 +1562,32 @@ mod tests {
             IntelligencePolicy::default(),
         )
         .unwrap();
-        assert!(
-            resolved
-                .decisions
-                .iter()
-                .any(|decision| decision.code == "missing_mask_hold")
-        );
+        assert!(resolved.decisions.iter().any(|decision| {
+            decision.code == "missing_mask_hold" && decision.disposition == PolicyDisposition::Hold
+        }));
         assert_eq!(
             resolved.operations[0].subjects,
             vec!["sightloom://gen-1/subjects/1".to_string()]
         );
         assert_eq!(resolved.operations[0].ranges[0].start.ticks, 0);
         assert_eq!(resolved.operations[0].ranges[0].end.ticks, 1_000_000_000);
+    }
+
+    #[test]
+    fn missing_mask_dilate_is_a_hold_not_a_review() {
+        let mut policy = IntelligencePolicy::default();
+        policy.privacy.missing_mask = MissingMaskAction::DilateLast;
+        let resolved = resolve_plan(&blur_one(1), &lone_subject(1, 1), policy).unwrap();
+        assert!(resolved.decisions.iter().any(|decision| {
+            decision.code == "missing_mask_dilate"
+                && decision.disposition == PolicyDisposition::Hold
+        }));
+        assert_eq!(
+            resolved.operations[0].subjects,
+            vec!["sightloom://gen-1/subjects/1".to_string()]
+        );
+        let decision: ResolutionDecision =
+            serde_json::from_str(r#"{"code":"select_subjects","message":"ok"}"#).unwrap();
+        assert_eq!(decision.disposition, PolicyDisposition::Noted);
     }
 }

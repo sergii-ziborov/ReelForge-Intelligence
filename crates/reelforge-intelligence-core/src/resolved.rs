@@ -103,16 +103,34 @@ pub struct ResolvedOperation {
     pub ranges: Vec<MediaRange>,
 }
 
+/// How a privacy rule applied. Approval reads this, not warning prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyDisposition {
+    /// Ordinary resolution note. It does not gate approval.
+    #[default]
+    Noted,
+    /// The subject was left out of the edit.
+    Skip,
+    /// A person must approve before execute.
+    Review,
+    /// Last-known geometry is held. This is not a completed mask.
+    Hold,
+}
+
 /// Why a subject/event was chosen or rejected.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolutionDecision {
-    /// Machine code (`most_frequent`, `selector_ids`, `anomaly_filter`, …).
+    /// Machine code (`most_frequent`, `missing_mask_review`, …).
     pub code: String,
     /// Human explanation.
     pub message: String,
     /// Related edit index in the intent plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit_index: Option<usize>,
+    /// Typed privacy outcome. Absent on plans frozen before dispositions.
+    #[serde(default)]
+    pub disposition: PolicyDisposition,
 }
 
 /// Non-fatal resolution note.

@@ -10,7 +10,7 @@ use crate::ids::{EntityKind, NamespacedId};
 use crate::mask::RegionSample;
 use crate::ops::edit_op_id;
 use crate::policy::{IntelligencePolicy, UncertaintyPolicy};
-use crate::resolved::{ResolvedEditPlan, ResolvedMaskAsset, ResolvedOperation};
+use crate::resolved::{PolicyDisposition, ResolvedEditPlan, ResolvedMaskAsset, ResolvedOperation};
 use crate::time::{MediaRange, MediaTime};
 use serde::{Deserialize, Serialize};
 
@@ -200,24 +200,11 @@ pub fn approval_for_resolved(
     {
         reasons.push("uncertain_identity=review".into());
     }
-    // The policy enum alone is not evidence. Review applies when resolve
-    // actually recorded a subject with no mask sample and no box.
-    if matches!(
-        policy.privacy.missing_mask,
-        crate::policy::MissingMaskAction::Review
-    ) && resolved
-        .warnings
-        .iter()
-        .any(|warning| warning.message.to_lowercase().contains("missing mask"))
-    {
-        reasons.push("missing_mask=review".into());
-    }
-    if resolved
-        .warnings
-        .iter()
-        .any(|w| w.message.to_lowercase().contains("review"))
-    {
-        reasons.push("resolution_warning_review".into());
+    // Review is a disposition on the decision. Warning prose is not a gate.
+    for decision in &resolved.decisions {
+        if decision.disposition == PolicyDisposition::Review {
+            reasons.push(decision.code.clone());
+        }
     }
     // Uncertain subjects with low confidence under TreatAsUncertain + Review path
     if matches!(policy.privacy.uncertain_identity, UncertaintyPolicy::Review) {
@@ -1005,14 +992,19 @@ mod tests {
         let mut bare = two_photos();
         bare.subject_boxes.clear();
         bare.subjects.retain(|subject| subject.subject_id == 1);
-        let missing = resolve_plan(&intent, &bare, policy.clone()).unwrap();
+        let mut missing = resolve_plan(&intent, &bare, policy.clone()).unwrap();
+        assert!(missing.decisions.iter().any(|decision| {
+            decision.code == "missing_mask_review"
+                && decision.disposition == PolicyDisposition::Review
+        }));
+        missing.warnings.clear();
         let approval = approval_for_resolved(&missing, &missing.policy);
         assert!(approval.required);
         assert!(
             approval
                 .reasons
                 .iter()
-                .any(|reason| reason == "missing_mask=review")
+                .any(|reason| reason == "missing_mask_review")
         );
 
         let mut with_box = bare;
@@ -1024,7 +1016,30 @@ mod tests {
             !approval
                 .reasons
                 .iter()
-                .any(|reason| reason == "missing_mask=review")
+                .any(|reason| reason == "missing_mask_review")
+        );
+    }
+
+    #[test]
+    fn warning_prose_does_not_require_approval() {
+        let policy = IntelligencePolicy::default();
+        let intent = SemanticEditPlan::new("cam1").with_edit(SemanticEdit::BlurSubject {
+            subject: crate::selector::SubjectSelector::SubjectIds { ids: vec![1] },
+        });
+        let mut analysis = two_photos();
+        analysis.subjects.retain(|subject| subject.subject_id == 1);
+        let mut resolved = resolve_plan(&intent, &analysis, policy).unwrap();
+        resolved.warnings.push(crate::ResolutionWarning {
+            message: "please review the color grade".into(),
+            edit_index: None,
+        });
+        let approval = approval_for_resolved(&resolved, &resolved.policy);
+        assert!(!approval.required);
+        assert!(
+            !approval
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("review"))
         );
     }
 }
