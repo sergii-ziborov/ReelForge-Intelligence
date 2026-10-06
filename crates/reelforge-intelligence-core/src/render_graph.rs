@@ -501,10 +501,11 @@ fn map_edit_to_op(
             )
         }
         SemanticEdit::BuildAnomalyReel { .. } | SemanticEdit::CreateEventClips { .. } => {
-            let events = operation_at(resolved, edit_index)
-                .map_or(resolved.resolved_events.len(), |operation| {
-                    operation.ranges.len()
-                });
+            let events = match operation_at(resolved, edit_index) {
+                Some(operation) => operation.ranges.len(),
+                None if resolved.operations.is_empty() => resolved.resolved_events.len(),
+                None => 0,
+            };
             let ranges = ranges_for(resolved, Some(edit_index));
             (
                 op_id::TIMELINE_CONCAT,
@@ -527,11 +528,17 @@ fn operation_at(resolved: &ResolvedEditPlan, edit_index: usize) -> Option<&Resol
 }
 
 /// Subjects this edit may change. An existing record wins even when it is empty.
+///
+/// A plan with no operation records is legacy and uses the union. A modern plan
+/// that lost this edit's record does not.
 fn subject_uris(resolved: &ResolvedEditPlan, edit_index: Option<usize>) -> Vec<String> {
-    if let Some(edit_index) = edit_index
-        && let Some(operation) = operation_at(resolved, edit_index)
-    {
-        return operation.subjects.clone();
+    if let Some(edit_index) = edit_index {
+        if let Some(operation) = operation_at(resolved, edit_index) {
+            return operation.subjects.clone();
+        }
+        if !resolved.operations.is_empty() {
+            return Vec::new();
+        }
     }
     resolved
         .resolved_subjects
@@ -541,11 +548,17 @@ fn subject_uris(resolved: &ResolvedEditPlan, edit_index: Option<usize>) -> Vec<S
 }
 
 /// Ranges this edit may change. An existing record wins even when it is empty.
+///
+/// A plan with no operation records is legacy and uses the union. A modern plan
+/// that lost this edit's record does not.
 fn ranges_for(resolved: &ResolvedEditPlan, edit_index: Option<usize>) -> Vec<MediaRange> {
-    if let Some(edit_index) = edit_index
-        && let Some(operation) = operation_at(resolved, edit_index)
-    {
-        return operation.ranges.clone();
+    if let Some(edit_index) = edit_index {
+        if let Some(operation) = operation_at(resolved, edit_index) {
+            return operation.ranges.clone();
+        }
+        if !resolved.operations.is_empty() {
+            return Vec::new();
+        }
     }
     resolved.resolved_ranges.clone()
 }
@@ -568,7 +581,10 @@ fn mask_count(resolved: &ResolvedEditPlan, edit_index: Option<usize>) -> usize {
         return resolved.resolved_masks.len();
     };
     let Some(operation) = operation_at(resolved, edit_index) else {
-        return resolved.resolved_masks.len();
+        if resolved.operations.is_empty() {
+            return resolved.resolved_masks.len();
+        }
+        return 0;
     };
     resolved
         .resolved_masks
@@ -608,10 +624,14 @@ fn follow_crop_params(
 
 /// Mask samples and snapshot boxes that belong to this edit.
 ///
-/// A plan with no operation record keeps every box. A record that names no
-/// subject yields no boxes, so another edit's geometry cannot move the crop.
+/// A plan with no operation records keeps every box. A modern plan that lost
+/// this edit's record keeps none. A record that names no subject also yields
+/// no boxes, so another edit's geometry cannot move the crop.
 fn scoped_region_boxes(resolved: &ResolvedEditPlan, edit_index: usize) -> Vec<RegionSample> {
     let operation = operation_at(resolved, edit_index);
+    if operation.is_none() && !resolved.operations.is_empty() {
+        return Vec::new();
+    }
     let mut boxes = Vec::new();
     for mask in &resolved.resolved_masks {
         if let Some(operation) = operation
@@ -913,6 +933,35 @@ mod tests {
         assert!(
             legacy_x < crop_x,
             "union crop x={legacy_x} must stay left of the scoped crop x={crop_x}"
+        );
+    }
+
+    #[test]
+    fn modern_plan_missing_one_operation_does_not_use_the_union() {
+        let mut resolved = resolve_plan(
+            &blur_and_follow(),
+            &two_photos(),
+            IntelligencePolicy::default(),
+        )
+        .unwrap();
+        assert!(resolved.operations.len() >= 2);
+        resolved
+            .operations
+            .retain(|operation| operation.edit_index != 1);
+        assert!(!resolved.operations.is_empty());
+        let graph = graph_from_resolved(&resolved);
+        let blur = node_params(&graph, op_id::REDACTION_REGION);
+        let follow = node_params(&graph, op_id::TRANSFORM_CROP);
+        assert_eq!(
+            string_list(blur, "subjects"),
+            vec!["sightloom://gen-1/subjects/1".to_string()]
+        );
+        assert_eq!(range_ticks(blur), vec![(0, 1_000_000_000)]);
+        assert!(string_list(follow, "subjects").is_empty());
+        assert!(range_ticks(follow).is_empty());
+        assert!(
+            follow.get("x").is_none(),
+            "a missing follow record must not inherit the union crop"
         );
     }
 
